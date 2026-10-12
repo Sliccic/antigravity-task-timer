@@ -1,0 +1,35 @@
+{
+  "name": "antigravity-task-timer",
+  "version": "1.0.0",
+  "description": "⏱️ Real-time session task duration timer, token metrics & cache hit monitor widget for Google Antigravity Desktop Client (Google 反重力桌面客户端任务执行耗时胶囊、Tokens 统计与缓存命中监控插件)",
+  "main": "src/task-timer-widget.js",
+  "bin": {
+    "antigravity-task-timer": "./bin/cli.js",
+    "antigravity-timer": "./bin/cli.js"
+  },
+  "scripts": {
+    "install-patch": "node bin/cli.js install",
+    "hot-reload": "node bin/cli.js hot-reload",
+    "restore": "node bin/cli.js restore"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Sliccic/antigravity-task-timer.git"
+  },
+  "keywords": [
+    "antigravity",
+    "google-antigravity",
+    "task-timer",
+    "task-duration",
+    "token-counter",
+    "prompt-caching",
+    "cache-hit",
+    "electron-plugin",
+    "realtime-monitor"
+  ],
+  "author": "Sliccic",
+  "license": "MIT",
+  "engines": {
+    "node": ">=16.0.0"
+  }
+}
