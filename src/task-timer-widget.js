@@ -1,7 +1,7 @@
 /**
  * Antigravity Real-Time Session Task Execution Timer & Metrics Indicator
  * Google 反重力桌面客户端任务耗时胶囊、Tokens 统计与缓存命中监控插件
- * 
+ *
  * 核心特性：
  * 1. 顶部标题栏实时任务胶囊：显示执行状态与动态秒级秒表 (● 执行中 01:23)
  * 2. 精准绑定【当前会话窗口】：基于 window.location 路由深度锁定当前会话，多任务并发不串台、不横跳
@@ -27,7 +27,7 @@
 
   // 唯一实例 ID 守卫：使旧实例在下一次循环时自动静默退出，彻底根除多版本/旧闭包争抢 DOM
   const WIDGET_INSTANCE_ID = 'agy_task_inst_' + Date.now() + '_' + Math.random().toString(36).slice(2, 7);
-  window.__AGY_TASK_ACTIVE_INSTANCE_ID__ = WIDGET_INSTANCE_ID;
+  window.__AGY_ACTIVE_INSTANCE_ID__ = WIDGET_INSTANCE_ID;
 
   if (window.__AGY_TASK_TICK_TIMER__) {
     clearInterval(window.__AGY_TASK_TICK_TIMER__);
@@ -40,16 +40,16 @@
 
   window.__AGY_TASK_TIMER_INITIALIZED__ = true;
 
-  // 字体栈（适配 Windows Consolas 与现代等宽无衬线体）
+  // 采用 Antigravity 原生字体栈（完美适配 Windows Consolas 与现代等宽无衬线体）
   const FONT_SANS = '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif';
   const FONT_MONO = 'Consolas, ui-monospace, SFMono-Regular, Menlo, monospace';
 
   // 注入微型柔和呼吸动效样式
-  if (typeof document !== 'undefined' && !document.getElementById('agy-task-pulse-style')) {
+  if (typeof document !== 'undefined' && !document.getElementById('agy-pulse-style')) {
     const s = document.createElement('style');
-    s.id = 'agy-task-pulse-style';
+    s.id = 'agy-pulse-style';
     s.textContent = `
-      @keyframes agy-task-pulse-dot {
+      @keyframes agy-pulse-dot {
         0%, 100% { opacity: 0.85; transform: scale(1); }
         50% { opacity: 1; transform: scale(1.12); box-shadow: 0 0 7px rgba(34,197,94,0.9); }
       }
@@ -58,10 +58,10 @@
   }
 
   // 用户持久化配置
-  const CONFIG_STORAGE_KEY = 'agy_task_timer_config';
+  const CONFIG_STORAGE_KEY = 'agy_quota_widget_config_v2';
   const DEFAULT_CONFIG = {
-    triggerMode: 'hover', // 'click' | 'hover'
-    timeStyle: 'zh'
+    triggerMode: 'hover',
+    taskTriggerMode: 'hover'
   };
 
   let config = loadConfig();
@@ -74,98 +74,149 @@
     return Object.assign({}, DEFAULT_CONFIG);
   }
 
-  // =========================================================================
-  // 当前会话窗口任务计时器与 Tokens 统计逻辑
+  // 2. 当前会话窗口任务计时器与 Tokens 统计逻辑
   // =========================================================================
   let currentTaskData = null;
-  let activeTaskState = null;
   let isFetchingTask = false;
   let isTaskPopoverPinned = false;
   let hideTaskPopoverTimer = null;
-  const trajectoryCache = new Map(); // trajectoryId -> { turnStepCount, outTokens, cacheTokens, inTokens, activeTool, lastModTime }
+  let activeTaskState = null; // 当前会话的状态信息
 
   function formatTaskDuration(sec) {
-    if (typeof sec !== 'number' || isNaN(sec) || sec < 0) sec = 0;
+    if (sec < 0 || isNaN(sec)) sec = 0;
     const m = Math.floor(sec / 60);
-    const s = Math.floor(sec % 60);
-    const mm = m < 10 ? '0' + m : '' + m;
-    const ss = s < 10 ? '0' + s : '' + s;
-    return `${mm}:${ss}`;
-  }
-
-  function formatTokens(num) {
-    if (typeof num !== 'number' || isNaN(num) || num <= 0) return '0';
-    if (num >= 1000000) return (num / 1000000).toFixed(1) + 'M';
-    if (num >= 1000) return (num / 1000).toFixed(1) + 'k';
-    return String(num);
-  }
-
-  // 精准提取当前窗口所属的会话 ID（绝对免疫于焦点移动和非会话标签）
-  function resolveCurrentWindowConversationId(trajectoriesList) {
-    if (!trajectoriesList || trajectoriesList.length === 0) return null;
-    if (trajectoriesList.length === 1) return trajectoriesList[0].id;
-
-    // 1. 最高优先权：直接从 window.location URL 路由解析 /c/<uuid>
-    try {
-      const path = window.location.pathname || window.location.href || '';
-      const match = path.match(/\/c\/([a-zA-Z0-9_-]+)/);
-      if (match && match[1]) {
-        const convId = match[1];
-        const found = trajectoriesList.find(t => t.id === convId);
-        if (found) return found.id;
-      }
-    } catch (_) {}
-
-    // 2. 次优先：从当前已激活的会话选项卡 DOM 或输入区属性获取
-    try {
-      const activeTabEl = document.querySelector('[role="tab"][aria-selected="true"], .tab.active, [data-conversation-id].active');
-      let cid = activeTabEl?.getAttribute('data-conversation-id') || activeTabEl?.getAttribute('data-session-id');
-      if (cid && trajectoriesList.some(t => t.id === cid)) return cid;
-
-      const inputArea = document.querySelector('[data-conversation-id], [data-session-id]');
-      cid = inputArea?.getAttribute('data-conversation-id') || inputArea?.getAttribute('data-session-id');
-      if (cid && trajectoriesList.some(t => t.id === cid)) return cid;
-    } catch (_) {}
-
-    // 3. 稳态防抖保全：如果先前已有确立的活跃会话，且该会话仍然存在，则坚决保持锁定
-    if (activeTaskState?.id && trajectoriesList.some(t => t.id === activeTaskState.id)) {
-      return activeTaskState.id;
+    const s = sec % 60;
+    const pad = (n) => String(n).padStart(2, '0');
+    if (m >= 60) {
+      const h = Math.floor(m / 60);
+      const remM = m % 60;
+      return `${pad(h)}:${pad(remM)}:${pad(s)}`;
     }
-
-    return trajectoriesList[0].id;
+    return `${pad(m)}:${pad(s)}`;
   }
 
-  // 异步获取具体轨迹的详细 Token 指标与最新工具调用信息
-  async function fetchTurnTokenMetrics(trajectoryId, lastModTime) {
-    if (!trajectoryId) return null;
+  function formatTokens(n) {
+    if (!n) return '0';
+    if (n >= 1000000) return (n / 1000000).toFixed(2) + 'M';
+    if (n >= 10000) return (n / 1000).toFixed(1) + 'k';
+    return Number(n).toLocaleString('en-US');
+  }
+
+  // 获取所有会话概览
+  async function fetchTaskStatus() {
+    if (isFetchingTask) return currentTaskData;
     const csrfToken = window.__APP_CONFIG__?.csrfToken;
     if (!csrfToken) return null;
 
-    const cached = trajectoryCache.get(trajectoryId);
-    if (cached && cached.lastModTime === lastModTime) {
-      return cached;
-    }
-
     try {
-      const res = await fetch('/exa.language_server_pb.LanguageServerService/GetTrajectory', {
+      isFetchingTask = true;
+      const res = await fetch('/exa.language_server_pb.LanguageServerService/GetAllCascadeTrajectories', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
           'x-codeium-csrf-token': csrfToken
         },
-        body: JSON.stringify({ trajectoryId })
+        body: JSON.stringify({})
       });
       if (!res.ok) return null;
       const json = await res.json();
-      const trajectory = json.trajectory || json;
-      const steps = trajectory?.steps || [];
+      currentTaskData = json;
+      return json;
+    } catch (err) {
+      return null;
+    } finally {
+      isFetchingTask = false;
+    }
+  }
 
-      let turnStepCount = 0;
-      let outTokens = 0;
-      let cacheTokens = 0;
-      let inTokens = 0;
-      let activeTool = null;
+  // 精准识别【当前窗口】对应的会话 ID
+  function resolveCurrentWindowConversationId(trajectoriesList) {
+    if (!trajectoriesList || trajectoriesList.length === 0) return null;
+    if (trajectoriesList.length === 1) return trajectoriesList[0].id;
 
+    // 1. 最高优先级：从当前活动窗口的 URL 中提取当前会话 UUID（/c/<uuid>）
+    // 在 Antigravity 中，活动聊天窗口的 URL 包含唯一会话 ID，极其可靠且不受焦点或标签切换变动干扰
+    try {
+      const urlText = (window.location.pathname || '') + ' ' + (window.location.href || '');
+      const urlMatch = urlText.match(/\/c\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i);
+      if (urlMatch) {
+        const convId = urlMatch[1];
+        const found = trajectoriesList.find(t => t.id === convId);
+        if (found) return found.id;
+      }
+    } catch (_) {}
+
+    // 2. 次高优先级：从主聊天工作区 DOM 检测活动会话容器
+    const activeChat = document.querySelector('.overflow-y-auto[data-cascade-id], [data-cascade-id].h-full, [data-cascade-id].bg-sidebar-secondary');
+    if (activeChat) {
+      const cid = activeChat.getAttribute('data-cascade-id');
+      if (cid && trajectoriesList.some(t => t.id === cid)) return cid;
+    }
+
+    // 3. 匹配 document.title（仅当标题包含会话名称且标题非默认窗口名时）
+    const docTitle = document.title || '';
+    if (docTitle && !docTitle.startsWith('Antigravity') && !docTitle.includes('Outside of Project')) {
+      for (const t of trajectoriesList) {
+        const title = t.annotations?.title || t.summary || '';
+        if (title && title.length > 1 && docTitle.includes(title)) {
+          return t.id;
+        }
+      }
+    }
+
+    // 4. 保底机制：如果之前已经锁定了某个会话且该会话仍在列表中，维持上一状态，绝不随意跳变到其他会话
+    if (activeTaskState?.id && trajectoriesList.some(t => t.id === activeTaskState.id)) {
+      return activeTaskState.id;
+    }
+
+    // 5. 最终保底：取最后浏览时间最新的会话
+    const sortedByView = [...trajectoriesList].sort((a, b) => {
+      const aView = new Date(a.annotations?.lastUserViewTime || 0).getTime();
+      const bView = new Date(b.annotations?.lastUserViewTime || 0).getTime();
+      return bView - aView;
+    });
+    return sortedByView[0]?.id || trajectoriesList[0].id;
+  }
+
+  // 本轮 Token 统计缓存 (convId -> { lastModTime, data })，避免重复全量读取 Base64 造成性能与界面卡顿
+  const tokenMetricsCache = new Map();
+
+  // 通过 LanguageServer ReadFile 读取指定会话 transcript.jsonl 并计算本轮 Token 统计
+  async function fetchTurnTokenMetrics(convId, lastModTime = 0) {
+    if (!convId) return null;
+    const cacheKey = convId;
+    if (lastModTime && tokenMetricsCache.has(cacheKey)) {
+      const cached = tokenMetricsCache.get(cacheKey);
+      if (cached.lastModTime === lastModTime) {
+        return cached.data;
+      }
+    }
+    const csrfToken = window.__APP_CONFIG__?.csrfToken;
+    if (!csrfToken) return null;
+
+    try {
+      const uri = `file:///C:/Users/HXY/.gemini/antigravity/brain/${convId}/.system_generated/logs/transcript.jsonl`;
+      const res = await fetch('/exa.language_server_pb.LanguageServerService/ReadFile', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-codeium-csrf-token': csrfToken
+        },
+        body: JSON.stringify({ uri })
+      });
+      if (!res.ok) return null;
+      const fileData = await res.json();
+      if (!fileData?.content) return null;
+
+      const binary = atob(fileData.content);
+      const bytes = Uint8Array.from(binary, c => c.charCodeAt(0));
+      const text = new TextDecoder('utf-8').decode(bytes);
+      const lines = text.trim().split('\n').filter(Boolean);
+
+      const steps = [];
+      for (const l of lines) {
+        try { steps.push(JSON.parse(l)); } catch (_) {}
+      }
       if (steps.length === 0) return null;
 
       let lastUserIdx = -1;
@@ -177,346 +228,333 @@
       }
       if (lastUserIdx === -1) return null;
 
-      const currentTurnSteps = steps.slice(lastUserIdx);
-      const lastStep = currentTurnSteps[currentTurnSteps.length - 1];
+      const turnSteps = steps.slice(lastUserIdx);
+      const lastStep = steps[steps.length - 1];
       const isCompleted = lastStep.type === 'PLANNER_RESPONSE' && (!lastStep.tool_calls || lastStep.tool_calls.length === 0);
 
-      turnStepCount = Math.max(0, currentTurnSteps.length - 1);
-
-      for (const st of currentTurnSteps) {
-        if (st.output_tokens) outTokens += Number(st.output_tokens) || 0;
-        if (st.cache_read_tokens) cacheTokens += Number(st.cache_read_tokens) || 0;
-        if (st.input_tokens) inTokens += Number(st.input_tokens) || 0;
+      let outTokens = 0;
+      let cacheTokens = 0;
+      let inTokens = 0;
+      for (const s of turnSteps) {
+        if (s.output_tokens) outTokens += s.output_tokens;
+        if (s.cache_read_tokens) cacheTokens += s.cache_read_tokens;
+        if (s.input_tokens) inTokens += s.input_tokens;
       }
 
-      if (!isCompleted && lastStep) {
-        if (lastStep.tool_calls && lastStep.tool_calls.length > 0) {
-          activeTool = lastStep.tool_calls[0].toolAction || lastStep.tool_calls[0].toolSummary || lastStep.tool_calls[0].name;
-        } else if (lastStep.thinking) {
-          activeTool = 'Agent 深度思考中';
-        }
+      let activeTool = null;
+      if (!isCompleted && lastStep.tool_calls && lastStep.tool_calls.length > 0) {
+        const tc = lastStep.tool_calls[0];
+        activeTool = tc.args?.toolSummary || tc.args?.toolAction || tc.name;
         if (typeof activeTool === 'string') activeTool = activeTool.replace(/^"|"$/g, '');
       }
 
-      const metrics = {
-        turnStepCount,
+      const result = {
+        turnStepCount: turnSteps.length,
+        isCompleted,
         outTokens,
         cacheTokens,
         inTokens,
-        activeTool,
-        lastModTime
+        activeTool
       };
-      trajectoryCache.set(trajectoryId, metrics);
-      return metrics;
-    } catch (_) {
+      tokenMetricsCache.set(cacheKey, { lastModTime, data: result });
+      return result;
+    } catch (err) {
       return null;
     }
   }
 
-  // 极速解析活动会话的最新任务状态
-  function resolveActiveTaskFast(raw) {
-    if (!raw) return null;
-    const list = raw.trajectories || (Array.isArray(raw) ? raw : []);
+  // 0ms 同步极速提取器：提取当前会话任务元信息与毫秒级时间，绝不被慢速 Token 解析阻塞
+  function resolveActiveTaskFast(data) {
+    if (!data?.trajectorySummaries) return null;
+    const list = Object.entries(data.trajectorySummaries).map(([id, t]) => ({
+      id,
+      ...t
+    }));
     if (list.length === 0) return null;
 
+    // 精准锁定当前窗口所属的会话
     const currentId = resolveCurrentWindowConversationId(list);
     let active = currentId ? list.find(t => t.id === currentId) : null;
     if (!active && activeTaskState?.id) {
       active = list.find(t => t.id === activeTaskState.id);
     }
-    if (!active) active = list[0];
+    if (!active) {
+      active = list[0];
+    }
 
     const isRunning = active.status === 'CASCADE_RUN_STATUS_RUNNING';
-    const isError = active.status === 'CASCADE_RUN_STATUS_FAILED' || active.status === 'CASCADE_RUN_STATUS_ERROR';
-
-    let userStartTime = null;
-    let fallbackStartTime = null;
-    if (active.lastModifiedTime) {
-      const mod = new Date(active.lastModifiedTime).getTime();
-      if (!isNaN(mod)) fallbackStartTime = mod;
-    }
-    if (active.createdTime) {
-      const cr = new Date(active.createdTime).getTime();
-      if (!isNaN(cr)) {
-        if (!fallbackStartTime) fallbackStartTime = cr;
-        userStartTime = cr;
-      }
-    }
-    if (!userStartTime && fallbackStartTime) userStartTime = fallbackStartTime;
+    const userStartTime = active.lastUserInputTime ? new Date(active.lastUserInputTime).getTime() : 0;
+    const lastModTime = active.lastModifiedTime ? new Date(active.lastModifiedTime).getTime() : 0;
 
     let elapsedSec = 0;
-    if (isRunning && userStartTime) {
-      elapsedSec = Math.max(0, Math.floor((Date.now() - userStartTime) / 1000));
-    } else if (active.metadata?.elapsedDurationSec) {
-      elapsedSec = Number(active.metadata.elapsedDurationSec);
-    } else if (active.elapsedTime) {
-      elapsedSec = Math.floor(Number(active.elapsedTime) / 1000);
-    } else if (userStartTime && fallbackStartTime) {
-      elapsedSec = Math.max(0, Math.floor((fallbackStartTime - userStartTime) / 1000));
+    if (isRunning) {
+      elapsedSec = userStartTime ? Math.max(0, Math.floor((Date.now() - userStartTime) / 1000)) : 0;
+    } else {
+      elapsedSec = (userStartTime && lastModTime) ? Math.max(0, Math.round((lastModTime - userStartTime) / 1000)) : 0;
     }
 
-    const cachedMetrics = trajectoryCache.get(active.id);
+    const cached = tokenMetricsCache.get(active.id)?.data;
 
     return {
       id: active.id,
-      title: active.summary || active.title || '当前会话任务',
-      status: active.status,
+      title: active.annotations?.title || active.summary || '当前会话任务',
       isRunning,
-      isError,
-      userStartTime: isRunning ? userStartTime : null,
-      lastModTime: active.lastModifiedTime,
+      userStartTime,
+      lastModTime,
       elapsedSec,
-      stepCount: cachedMetrics ? cachedMetrics.turnStepCount : (active.stepCount || 0),
-      outTokens: cachedMetrics ? cachedMetrics.outTokens : 0,
-      cacheTokens: cachedMetrics ? cachedMetrics.cacheTokens : 0,
-      inTokens: cachedMetrics ? cachedMetrics.inTokens : 0,
-      activeTool: cachedMetrics ? cachedMetrics.activeTool : null
+      stepCount: cached?.turnStepCount || active.stepCount || 0,
+      outTokens: cached?.outTokens || 0,
+      cacheTokens: cached?.cacheTokens || 0,
+      inTokens: cached?.inTokens || 0,
+      activeTool: cached?.activeTool || null
     };
   }
 
-  async function fetchTaskStatus() {
-    if (isFetchingTask) return currentTaskData;
-    const csrfToken = window.__APP_CONFIG__?.csrfToken;
-    if (!csrfToken) return null;
-
-    try {
-      isFetchingTask = true;
-      const res = await fetch('/exa.language_server_pb.LanguageServerService/ListTrajectories', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-codeium-csrf-token': csrfToken
-        },
-        body: JSON.stringify({ pageSize: 10 })
-      });
-      if (!res.ok) throw new Error('HTTP ' + res.status);
-      const json = await res.json();
-      currentTaskData = json;
-      return json;
-    } catch (_) {
-      return null;
-    } finally {
-      isFetchingTask = false;
-    }
-  }
-
-  function getTaskPopover() {
+  function getOrCreateTaskPopover() {
     let popover = document.getElementById('agy-task-popover');
     if (!popover) {
       popover = document.createElement('div');
       popover.id = 'agy-task-popover';
       popover.style.cssText = [
+        '-webkit-app-region: no-drag !important',
+        'app-region: no-drag !important',
         'position: fixed',
-        'display: none',
         'z-index: 999999',
-        'width: 320px',
-        'background: #18181b',
+        'width: 350px',
+        'background: #121316',
         'border: 1px solid #27272a',
-        'border-radius: 12px',
-        'box-shadow: 0 16px 36px rgba(0,0,0,0.65), 0 0 0 1px rgba(255,255,255,0.06)',
-        'padding: 16px',
-        'color: #fafafa',
-        'font-family: ' + FONT_SANS,
+        'border-radius: 10px',
+        'box-shadow: 0 20px 48px rgba(0,0,0,0.65), 0 4px 16px rgba(0,0,0,0.3)',
+        'padding: 12px',
         'font-size: 13px',
-        'box-sizing: border-box',
+        'color: #e4e4e7',
+        'backdrop-filter: blur(14px)',
+        '-webkit-backdrop-filter: blur(14px)',
+        'display: none',
         'opacity: 0',
-        'transform: translateY(-4px)',
-        'transition: opacity 0.15s ease, transform 0.15s ease',
-        'pointer-events: auto'
+        'transform: translateY(-6px)',
+        'transition: opacity 0.18s ease, transform 0.18s ease',
+        'pointer-events: auto',
+        'font-family: ' + FONT_SANS
       ].join(';');
 
       popover.addEventListener('mouseenter', () => {
-        if (hideTaskPopoverTimer) {
-          clearTimeout(hideTaskPopoverTimer);
-          hideTaskPopoverTimer = null;
-        }
+        if (hideTaskPopoverTimer) clearTimeout(hideTaskPopoverTimer);
       });
       popover.addEventListener('mouseleave', () => {
-        const mode = config.triggerMode || 'hover';
+        if (isTaskPopoverPinned) return;
+        const mode = config.taskTriggerMode || 'hover';
         if (mode === 'hover') scheduleHideTaskPopover();
       });
-
+      popover.addEventListener('click', (e) => e.stopPropagation());
       document.body.appendChild(popover);
     }
     return popover;
   }
 
-  function openTaskPopover(anchorEl, pin = false) {
-    if (hideTaskPopoverTimer) {
-      clearTimeout(hideTaskPopoverTimer);
-      hideTaskPopoverTimer = null;
-    }
+  function openTaskPopover(targetElement, pin = false) {
+    closeQuotaPopover();
+    if (hideTaskPopoverTimer) clearTimeout(hideTaskPopoverTimer);
     if (pin) isTaskPopoverPinned = true;
 
-    const popover = getTaskPopover();
-    renderTaskPopoverContent(activeTaskState);
-
+    const popover = getOrCreateTaskPopover();
+    const rect = targetElement.getBoundingClientRect();
     popover.style.display = 'block';
-    const rect = anchorEl.getBoundingClientRect();
-    const top = rect.bottom + 8;
-    let left = rect.left + (rect.width / 2) - 160;
-
-    const maxLeft = window.innerWidth - 330;
-    if (left > maxLeft) left = maxLeft;
-    if (left < 10) left = 10;
-
+    const left = Math.max(12, Math.min(window.innerWidth - 365, rect.left));
+    const top = rect.bottom + 6;
     popover.style.top = top + 'px';
     popover.style.left = left + 'px';
-
-    requestAnimationFrame(() => {
-      popover.style.opacity = '1';
-      popover.style.transform = 'translateY(0)';
-    });
+    popover.style.opacity = '1';
+    popover.style.transform = 'translateY(0)';
+    targetElement.style.background = 'var(--secondary, rgba(255,255,255,0.12))';
   }
 
-  function closeTaskPopover(force = false) {
-    if (isTaskPopoverPinned && !force) return;
+  function closeTaskPopover() {
     isTaskPopoverPinned = false;
     const popover = document.getElementById('agy-task-popover');
-    if (popover) {
-      popover.style.opacity = '0';
-      popover.style.transform = 'translateY(-4px)';
-      setTimeout(() => {
-        if (!isTaskPopoverPinned && popover.style.opacity === '0') {
-          popover.style.display = 'none';
-        }
-      }, 150);
+    const pill = document.getElementById('agy-task-timer-topbar');
+    if (pill) {
+      if (activeTaskState && activeTaskState.isRunning) {
+        pill.style.background = 'rgba(34, 197, 94, 0.12)';
+      } else {
+        pill.style.background = 'var(--card, rgba(255,255,255,0.06))';
+      }
     }
+    if (!popover) return;
+
+    popover.style.opacity = '0';
+    popover.style.transform = 'translateY(-6px)';
+    setTimeout(() => {
+      if (!isTaskPopoverPinned && popover.style.opacity === '0') {
+        popover.style.display = 'none';
+      }
+    }, 180);
   }
 
   function scheduleHideTaskPopover() {
     if (isTaskPopoverPinned) return;
     if (hideTaskPopoverTimer) clearTimeout(hideTaskPopoverTimer);
     hideTaskPopoverTimer = setTimeout(() => {
-      closeTaskPopover();
-    }, 250);
+      if (!isTaskPopoverPinned) closeTaskPopover();
+    }, 220);
   }
 
   function renderTaskPopoverContent(task) {
-    const popover = getTaskPopover();
+    if (window.__AGY_ACTIVE_INSTANCE_ID__ !== WIDGET_INSTANCE_ID) return;
+    const popover = getOrCreateTaskPopover();
     if (!task) {
-      popover.innerHTML = `
-        <div style="display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid #27272a;padding-bottom:10px;margin-bottom:12px;">
-          <div style="font-weight:600;font-size:14px;color:#fafafa;display:flex;align-items:center;gap:6px;">
-            <span>⏱️ 任务执行监视</span>
-          </div>
-          <button id="agy-task-refresh-btn" style="background:transparent;border:none;color:#a1a1aa;cursor:pointer;font-size:13px;padding:2px 4px;">🔄</button>
-        </div>
-        <div style="text-align:center;padding:24px 0;color:#71717a;font-size:12px;">
-          当前会话窗口暂无活动或历史任务
-        </div>
-      `;
-      const refBtn = popover.querySelector('#agy-task-refresh-btn');
-      if (refBtn) {
-        refBtn.onclick = async (e) => {
-          e.stopPropagation();
-          refBtn.textContent = '⏳';
-          await refreshTaskOnly(true);
-        };
-      }
+      popover.innerHTML = `<div style="font-family:${FONT_SANS};color:#a1a1aa;text-align:center;padding:16px;">暂无当前会话任务</div>`;
       return;
     }
 
-    const timerStr = formatTaskDuration(task.elapsedSec);
     const isRunning = task.isRunning;
-    const isError = task.isError;
-    const statusText = isRunning ? '正在执行' : (isError ? '执行出错' : '已就绪 / 完成');
-    const statusColor = isRunning ? '#22c55e' : (isError ? '#ef4444' : '#94a3b8');
+    const timeFormatted = formatTaskDuration(task.elapsedSec);
+    const startTimeText = task.userStartTime ? new Date(task.userStartTime).toLocaleTimeString() : '--';
 
-    // 增量更新已存在的 DOM，杜绝频繁展开时的白屏/闪烁
-    const timerNumEl = popover.querySelector('#agy-task-popover-timer');
-    if (timerNumEl) {
-      timerNumEl.textContent = timerStr;
-      const statusBadge = popover.querySelector('#agy-task-popover-status-badge');
+    const timerEl = popover.querySelector('#agy-task-popover-timer');
+    if (timerEl) {
+      // 增量精准更新，绝不重复销毁 DOM，彻底消除卡顿与闪烁
+      timerEl.textContent = timeFormatted;
+      timerEl.style.color = isRunning ? '#22c55e' : '#e4e4e7';
+
+      const heroCard = popover.querySelector('#agy-task-hero-card');
+      if (heroCard) {
+        heroCard.style.borderColor = isRunning ? 'rgba(34,197,94,0.35)' : '#27272a';
+        heroCard.style.boxShadow = isRunning ? '0 0 16px rgba(34,197,94,0.08)' : 'none';
+      }
+
+      const timerSubtitle = popover.querySelector('#agy-task-timer-subtitle');
+      if (timerSubtitle) timerSubtitle.textContent = isRunning ? '当前任务已执行' : '上一轮任务总耗时';
+
+      const startTimeEl = popover.querySelector('#agy-task-start-time');
+      if (startTimeEl) startTimeEl.textContent = `开始: ${startTimeText}`;
+
+      const titleEl = popover.querySelector('#agy-task-title-text');
+      if (titleEl) {
+        titleEl.textContent = task.title;
+        titleEl.title = task.title;
+      }
+
+      const statusBadge = popover.querySelector('#agy-task-status-badge');
       if (statusBadge) {
-        statusBadge.textContent = statusText;
-        statusBadge.style.background = isRunning ? 'rgba(34,197,94,0.18)' : (isError ? 'rgba(239,68,68,0.18)' : 'rgba(148,163,184,0.18)');
-        statusBadge.style.color = statusColor;
-      }
-      const titleEl = popover.querySelector('#agy-task-popover-task-title');
-      if (titleEl) titleEl.textContent = task.title;
-
-      const actionText = popover.querySelector('#agy-task-popover-action-text');
-      if (actionText) actionText.textContent = task.activeTool || (isRunning ? 'Agent 正在规划下一步动作...' : '本轮对话已顺利交付');
-
-      const stepEl = popover.querySelector('#agy-task-metric-steps');
-      if (stepEl) stepEl.textContent = String(task.stepCount || 0);
-
-      const outEl = popover.querySelector('#agy-task-metric-out');
-      if (outEl) {
-        outEl.textContent = formatTokens(task.outTokens);
-        outEl.title = Number(task.outTokens).toLocaleString();
+        statusBadge.style.background = isRunning ? 'rgba(34,197,94,0.15)' : 'rgba(148,163,184,0.15)';
+        statusBadge.style.color = isRunning ? '#22c55e' : '#a1a1aa';
+        const badgeDot = statusBadge.querySelector('.agy-badge-dot');
+        if (badgeDot) {
+          badgeDot.style.animation = isRunning ? 'agy-pulse-dot 1.5s infinite' : 'none';
+        }
+        const badgeText = statusBadge.querySelector('.agy-badge-text');
+        if (badgeText) badgeText.textContent = isRunning ? '执行中' : '已就绪';
       }
 
-      const cacheEl = popover.querySelector('#agy-task-metric-cache');
-      if (cacheEl) {
-        cacheEl.textContent = formatTokens(task.cacheTokens);
-        cacheEl.title = Number(task.cacheTokens).toLocaleString();
+      const stepStatusEl = popover.querySelector('#agy-task-step-status');
+      if (stepStatusEl) {
+        stepStatusEl.textContent = task.activeTool ? '⚡ ' + task.activeTool : (isRunning ? '🧠 Agent Thinking / Planning' : '✓ 任务已完成');
       }
 
-      const inEl = popover.querySelector('#agy-task-metric-in');
-      if (inEl) inEl.textContent = formatTokens(task.inTokens);
+      const stepDescEl = popover.querySelector('#agy-task-step-desc');
+      if (stepDescEl) {
+        stepDescEl.textContent = task.activeTool ? '正在调用系统工具执行操作...' : (isRunning ? '模型正在推理与规划响应...' : '等待用户新的指令...');
+      }
+
+      const stepBadge = popover.querySelector('#agy-task-step-badge');
+      if (stepBadge) stepBadge.textContent = isRunning ? '进行中' : '就绪';
+
+      const stepsCountEl = popover.querySelector('#agy-task-metric-steps');
+      if (stepsCountEl) stepsCountEl.textContent = task.stepCount;
+
+      const outTokensEl = popover.querySelector('#agy-task-metric-out');
+      if (outTokensEl) {
+        outTokensEl.textContent = formatTokens(task.outTokens);
+        outTokensEl.title = Number(task.outTokens).toLocaleString();
+      }
+
+      const cacheTokensEl = popover.querySelector('#agy-task-metric-cache');
+      if (cacheTokensEl) {
+        cacheTokensEl.textContent = formatTokens(task.cacheTokens);
+        cacheTokensEl.title = Number(task.cacheTokens).toLocaleString();
+      }
+
+      const inTokensEl = popover.querySelector('#agy-task-metric-in');
+      if (inTokensEl) inTokensEl.textContent = formatTokens(task.inTokens);
 
       return;
     }
 
+    // 初次创建完整模板结构
     popover.innerHTML = `
       <!-- Header -->
-      <div style="display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid #27272a;padding-bottom:10px;margin-bottom:14px;">
-        <div style="font-weight:600;font-size:13px;color:#f4f4f5;display:flex;align-items:center;gap:6px;">
-          <span>⏱️ 当前会话耗时监视</span>
+      <div style="display:flex;justify-content:space-between;align-items:center;padding-bottom:10px;border-bottom:1px solid #27272a;font-family:${FONT_SANS};">
+        <div style="display:flex;align-items:center;gap:7px;font-weight:600;font-size:14px;color:#e4e4e7;">
+          <span style="color:#3b82f6;font-size:15px;">⏱️</span>
+          <span>任务计时器</span>
         </div>
         <div style="display:flex;align-items:center;gap:8px;">
-          <span id="agy-task-popover-status-badge" style="font-size:10px;padding:2px 7px;border-radius:9999px;font-weight:600;font-family:${FONT_SANS};background:${isRunning ? 'rgba(34,197,94,0.18)' : (isError ? 'rgba(239,68,68,0.18)' : 'rgba(148,163,184,0.18)')};color:${statusColor};">
-            ${statusText}
+          <span id="agy-task-status-badge" style="display:inline-flex;align-items:center;gap:5px;padding:3px 8px;border-radius:12px;font-size:11px;font-weight:500;${isRunning ? 'background:rgba(34,197,94,0.15);color:#22c55e;' : 'background:rgba(148,163,184,0.15);color:#a1a1aa;'}">
+            <span class="agy-badge-dot" style="width:6px;height:6px;border-radius:50%;background:currentColor;display:inline-block;${isRunning ? 'animation:agy-pulse-dot 1.5s infinite;' : ''}"></span>
+            <span class="agy-badge-text">${isRunning ? '执行中' : '已就绪'}</span>
           </span>
-          <button id="agy-task-refresh-btn" title="强制刷新状态" style="background:transparent;border:none;color:#a1a1aa;cursor:pointer;font-size:12px;padding:2px 4px;line-height:1;">🔄</button>
+          <button id="agy-task-refresh-btn" title="立即刷新状态" style="-webkit-app-region:no-drag;cursor:pointer;background:transparent;border:1px solid #27272a;color:#a1a1aa;border-radius:6px;width:26px;height:26px;display:flex;align-items:center;justify-content:center;font-size:12px;transition:all 0.15s;">
+            🔄
+          </button>
         </div>
       </div>
 
-      <!-- Main Timer Showcase (Geek Consolas Style) -->
-      <div style="text-align:center;padding:12px 10px 14px;background:#09090b;border:1px solid #27272a;border-radius:10px;margin-bottom:12px;">
-        <div id="agy-task-popover-timer" style="font-family:${FONT_MONO};font-size:38px;font-weight:800;letter-spacing:1px;color:#22c55e;line-height:1.1;text-shadow:0 0 16px rgba(34,197,94,0.25);">
-          ${timerStr}
+      <!-- Hero Timer Card -->
+      <div id="agy-task-hero-card" style="background:#1a1b20;border:1px solid ${isRunning ? 'rgba(34,197,94,0.35)' : '#27272a'};border-radius:8px;padding:12px;text-align:center;margin-top:10px;${isRunning ? 'box-shadow:0 0 16px rgba(34,197,94,0.08);' : ''}">
+        <div id="agy-task-timer-subtitle" style="font-size:11px;font-weight:500;color:#a1a1aa;letter-spacing:0.5px;margin-bottom:2px;font-family:${FONT_SANS};">
+          ${isRunning ? '当前任务已执行' : '上一轮任务总耗时'}
         </div>
-        <div style="display:flex;align-items:center;justify-content:center;gap:6px;margin-top:6px;">
-          <span style="font-size:11px;color:#71717a;font-family:${FONT_SANS};">
-            开始于 ${task.userStartTime ? new Date(task.userStartTime).toLocaleTimeString([], { hour:'2-digit', minute:'2-digit', second:'2-digit' }) : '--:--:--'}
-          </span>
-          <span style="font-size:10px;color:#60a5fa;background:rgba(59,130,246,0.15);padding:1px 6px;border-radius:4px;font-family:${FONT_MONO};">
-            指令耗时
-          </span>
+        <div id="agy-task-popover-timer" style="font-family:${FONT_MONO};font-size:38px;font-weight:700;letter-spacing:-1px;color:${isRunning ? '#22c55e' : '#e4e4e7'};line-height:1.15;margin:4px 0;">
+          ${timeFormatted}
         </div>
-      </div>
-
-      <!-- Task Title & Active Tool -->
-      <div style="margin-bottom:12px;background:rgba(255,255,255,0.02);border:1px solid #27272a;border-radius:8px;padding:8px 10px;">
-        <div id="agy-task-popover-task-title" style="font-weight:600;font-size:12px;color:#e4e4e7;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-family:${FONT_SANS};">
-          ${task.title}
+        <div id="agy-task-start-time" style="font-size:10px;color:#a1a1aa;margin-top:2px;font-family:${FONT_MONO};">
+          开始: ${startTimeText}
         </div>
-        <div style="display:flex;align-items:center;gap:5px;margin-top:4px;font-size:11px;color:#a1a1aa;font-family:${FONT_SANS};">
-          <span style="color:#eab308;font-size:12px;">⚡</span>
-          <span id="agy-task-popover-action-text" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:#cbd5e1;font-family:${FONT_MONO};font-size:11px;">
-            ${task.activeTool || (isRunning ? 'Agent 正在规划下一步动作...' : '本轮对话已顺利交付')}
+        <div style="margin-top:10px;background:#27272a;border-radius:6px;padding:6px 8px;text-align:left;display:flex;align-items:flex-start;gap:6px;font-size:11px;">
+          <span style="background:rgba(59,130,246,0.2);color:#60a5fa;font-size:9px;padding:1px 4px;border-radius:3px;font-weight:600;flex-shrink:0;">指令</span>
+          <span id="agy-task-title-text" style="color:#e4e4e7;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;line-height:1.35;font-family:${FONT_SANS};" title="${task.title}">
+            ${task.title}
           </span>
         </div>
       </div>
 
-      <!-- Turn Token & Cache Metrics Grid -->
-      <div style="display:grid;grid-template-columns:repeat(3, 1fr);gap:8px;text-align:center;">
-        <div style="background:#09090b;padding:8px 6px;border-radius:8px;border:1px solid #27272a;">
-          <div id="agy-task-metric-steps" style="font-family:${FONT_MONO};font-size:15px;font-weight:700;color:#f4f4f5;">
-            ${task.stepCount || 0}
+      <!-- Active Step Card -->
+      <div style="background:#1a1b20;border:1px solid ${isRunning ? 'rgba(59,130,246,0.4)' : '#27272a'};border-radius:8px;padding:10px 12px;margin-top:8px;">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
+          <div style="font-weight:600;font-size:12px;color:#e4e4e7;display:flex;align-items:center;gap:6px;font-family:${FONT_SANS};">
+            <span style="width:7px;height:7px;border-radius:50%;background:${isRunning ? '#22c55e' : '#94a3b8'};display:inline-block;${isRunning ? 'animation:agy-pulse-dot 1.2s infinite;' : ''}"></span>
+            当前步骤状态
+          </div>
+          <span id="agy-task-step-badge" style="font-family:${FONT_MONO};font-size:11px;font-weight:600;color:#3b82f6;background:rgba(59,130,246,0.1);padding:1px 6px;border-radius:4px;">
+            ${isRunning ? '进行中' : '就绪'}
+          </span>
+        </div>
+        <div id="agy-task-step-status" style="font-family:${FONT_MONO};font-size:12px;font-weight:600;color:#38bdf8;display:flex;align-items:center;gap:5px;">
+          <span>${task.activeTool ? '⚡ ' + task.activeTool : (isRunning ? '🧠 Agent Thinking / Planning' : '✓ 任务已完成')}</span>
+        </div>
+        <div id="agy-task-step-desc" style="font-size:11px;color:#a1a1aa;margin-top:2px;font-family:${FONT_SANS};">
+          ${task.activeTool ? '正在调用系统工具执行操作...' : (isRunning ? '模型正在推理与规划响应...' : '等待用户新的指令...')}
+        </div>
+      </div>
+
+      <!-- Metrics Grid (3 Columns like Image 2) -->
+      <div style="display:grid;grid-template-columns:repeat(3, 1fr);gap:8px;margin-top:8px;">
+        <div style="background:#1a1b20;border:1px solid #27272a;border-radius:7px;padding:8px 6px;text-align:center;">
+          <div id="agy-task-metric-steps" style="font-family:${FONT_MONO};font-size:15px;font-weight:700;color:#e4e4e7;">
+            ${task.stepCount}
           </div>
           <div style="font-size:11px;color:#a1a1aa;margin-top:2px;font-family:${FONT_SANS};">步骤数</div>
         </div>
-        <div style="background:#09090b;padding:8px 6px;border-radius:8px;border:1px solid #27272a;">
-          <div id="agy-task-metric-out" style="font-family:${FONT_MONO};font-size:15px;font-weight:700;color:#60a5fa;" title="${Number(task.outTokens).toLocaleString()}">
+
+        <div style="background:#1a1b20;border:1px solid #27272a;border-radius:7px;padding:8px 6px;text-align:center;">
+          <div id="agy-task-metric-out" style="font-family:${FONT_MONO};font-size:15px;font-weight:700;color:#e4e4e7;" title="${Number(task.outTokens).toLocaleString()}">
             ${formatTokens(task.outTokens)}
           </div>
           <div style="font-size:11px;color:#a1a1aa;margin-top:2px;font-family:${FONT_SANS};">输出 Tokens</div>
         </div>
-        <div style="background:#09090b;padding:8px 6px;border-radius:8px;border:1px solid #27272a;">
+
+        <div style="background:#1a1b20;border:1px solid #27272a;border-radius:7px;padding:8px 6px;text-align:center;">
           <div id="agy-task-metric-cache" style="font-family:${FONT_MONO};font-size:15px;font-weight:700;color:#22c55e;" title="${Number(task.cacheTokens).toLocaleString()}">
             ${formatTokens(task.cacheTokens)}
           </div>
@@ -542,7 +580,7 @@
   }
 
   function updateTaskTimerPill(task) {
-    if (window.__AGY_TASK_ACTIVE_INSTANCE_ID__ !== WIDGET_INSTANCE_ID) return;
+    if (window.__AGY_ACTIVE_INSTANCE_ID__ !== WIDGET_INSTANCE_ID) return;
     const topBar = document.querySelector('.bg-sidebar') || document.querySelector('.shrink-0');
     if (!topBar) return;
 
@@ -579,11 +617,11 @@
       `;
 
       pill.addEventListener('mouseenter', () => {
-        const mode = config.triggerMode || 'hover';
+        const mode = config.taskTriggerMode || 'hover';
         if (mode === 'hover') openTaskPopover(pill, false);
       });
       pill.addEventListener('mouseleave', () => {
-        const mode = config.triggerMode || 'hover';
+        const mode = config.taskTriggerMode || 'hover';
         if (mode === 'hover') scheduleHideTaskPopover();
       });
       pill.addEventListener('click', (e) => {
@@ -599,7 +637,6 @@
         }
       });
 
-      // 如果有配额胶囊，放置在配额胶囊之后；否则直接挂在顶栏
       const quotaPill = document.getElementById('agy-model-quota-topbar');
       if (quotaPill && quotaPill.nextSibling) {
         topBar.insertBefore(pill, quotaPill.nextSibling);
@@ -611,66 +648,77 @@
     const dotEl = pill.querySelector('#agy-task-pill-dot');
     const textEl = pill.querySelector('#agy-task-pill-text');
     const badgeEl = pill.querySelector('#agy-task-pill-badge');
+    if (!dotEl || !textEl) return;
 
     if (!task) {
-      if (dotEl) {
-        dotEl.style.background = '#94a3b8';
-        dotEl.style.boxShadow = 'none';
-        dotEl.style.animation = 'none';
-      }
-      if (textEl) textEl.textContent = '任务就绪';
+      pill.style.background = 'var(--card, rgba(255,255,255,0.06))';
+      pill.style.borderColor = 'var(--border, rgba(255,255,255,0.12))';
+      dotEl.style.background = '#94a3b8';
+      dotEl.style.boxShadow = 'none';
+      dotEl.style.animation = 'none';
+      textEl.style.color = '#e4e4e7';
+      textEl.style.fontSize = '11px';
+      textEl.style.fontWeight = 'normal';
+      textEl.textContent = '就绪';
       if (badgeEl) badgeEl.style.display = 'none';
-      pill.title = '当前会话暂无任务\n单击展开详情与 Token 统计';
+      pill.title = '当前会话任务就绪\n单击展开详情与 Token 统计';
       return;
     }
 
+    const isRunning = task.isRunning;
     const timeFormatted = formatTaskDuration(task.elapsedSec);
 
-    if (task.isRunning) {
-      if (dotEl) {
-        dotEl.style.background = '#22c55e';
-        if (!dotEl.style.animation || dotEl.style.animation === 'none') {
-          dotEl.style.animation = 'agy-task-pulse-dot 1.8s infinite ease-in-out';
-        }
+    if (isRunning) {
+      pill.style.background = 'rgba(34, 197, 94, 0.12)';
+      pill.style.borderColor = 'rgba(34, 197, 94, 0.35)';
+
+      dotEl.style.background = '#22c55e';
+      dotEl.style.boxShadow = '0 0 6px rgba(34,197,94,0.8)';
+      if (!dotEl.style.animation || dotEl.style.animation === 'none') {
+        dotEl.style.animation = 'agy-pulse-dot 1.5s infinite';
       }
-      if (textEl) {
-        textEl.textContent = `执行中 ${timeFormatted}`;
-      }
+
+      textEl.style.color = '#22c55e';
+      textEl.style.fontSize = '12px';
+      textEl.style.fontWeight = '600';
+      textEl.textContent = `执行中 ${timeFormatted}`;
+
       if (badgeEl) {
         if (task.activeTool) {
-          badgeEl.textContent = task.activeTool;
+          badgeEl.textContent = `⚡${task.activeTool}`;
           badgeEl.style.display = 'inline-block';
         } else {
           badgeEl.style.display = 'none';
         }
       }
-      pill.title = `任务正在执行: ${timeFormatted}\n当前步骤: ${task.activeTool || '思考中'}\n单击展开详情与 Token 统计`;
-    } else if (task.isError) {
-      if (dotEl) {
-        dotEl.style.background = '#ef4444';
-        dotEl.style.boxShadow = 'none';
-        dotEl.style.animation = 'none';
-      }
-      if (textEl) textEl.textContent = `失败 ${timeFormatted}`;
-      if (badgeEl) badgeEl.style.display = 'none';
-      pill.title = `任务执行失败 (耗时: ${timeFormatted})\n单击查看详情`;
+
+      pill.title = `当前会话任务执行中: 已耗时 ${timeFormatted}\n单击展开详情与 Token 统计`;
     } else {
-      if (dotEl) {
-        dotEl.style.background = '#94a3b8';
-        dotEl.style.boxShadow = 'none';
-        dotEl.style.animation = 'none';
-      }
-      if (textEl) {
-        textEl.textContent = task.elapsedSec > 0 ? `已完成 ${timeFormatted}` : '就绪';
-      }
+      pill.style.background = 'var(--card, rgba(255,255,255,0.06))';
+      pill.style.borderColor = 'var(--border, rgba(255,255,255,0.12))';
+
+      dotEl.style.background = '#94a3b8';
+      dotEl.style.boxShadow = 'none';
+      dotEl.style.animation = 'none';
+
+      textEl.style.color = '#e4e4e7';
+      textEl.style.fontSize = '11px';
+      textEl.style.fontWeight = 'normal';
+      textEl.textContent = task.elapsedSec ? `已完成 ${timeFormatted}` : '就绪';
+
       if (badgeEl) badgeEl.style.display = 'none';
       pill.title = `当前会话任务就绪 (上次耗时: ${timeFormatted})\n单击展开详情与 Token 统计`;
     }
   }
 
-  // 本地每秒平滑秒表递增
+
+  // =========================================================================
+
+  // =========================================================================
+  // 3. 全局秒级本地平滑秒表与状态刷新
+  // =========================================================================
   function tickTimer() {
-    if (window.__AGY_TASK_ACTIVE_INSTANCE_ID__ !== WIDGET_INSTANCE_ID) return;
+    if (window.__AGY_ACTIVE_INSTANCE_ID__ !== WIDGET_INSTANCE_ID) return;
     if (activeTaskState && activeTaskState.isRunning && activeTaskState.userStartTime) {
       const elapsed = Math.max(0, Math.floor((Date.now() - activeTaskState.userStartTime) / 1000));
       activeTaskState.elapsedSec = elapsed;
@@ -685,9 +733,9 @@
   }
 
   async function refreshTaskOnly(force = false) {
-    if (window.__AGY_TASK_ACTIVE_INSTANCE_ID__ !== WIDGET_INSTANCE_ID) return;
+    if (window.__AGY_ACTIVE_INSTANCE_ID__ !== WIDGET_INSTANCE_ID) return;
     const raw = await fetchTaskStatus();
-    if (!raw || window.__AGY_TASK_ACTIVE_INSTANCE_ID__ !== WIDGET_INSTANCE_ID) return;
+    if (!raw || window.__AGY_ACTIVE_INSTANCE_ID__ !== WIDGET_INSTANCE_ID) return;
 
     // 1. 0ms 同步极速通道：提取当前会话并毫秒级更新顶栏胶囊与标题
     activeTaskState = resolveActiveTaskFast(raw);
@@ -717,7 +765,7 @@
       clearInterval(window.__AGY_TASK_POLL_TIMER__);
       window.__AGY_TASK_POLL_TIMER__ = null;
     }
-    // 1 秒一次同步当前窗口会话与任务变动
+    // 快速任务轮询（1 秒一次极速同步当前窗口会话与任务变动）
     window.__AGY_TASK_POLL_TIMER__ = setInterval(() => {
       refreshTaskOnly(false);
     }, 1000);
@@ -758,7 +806,7 @@
     refreshTaskOnly(true);
     setupPollingTimer();
 
-    // 启动 1 秒本地平滑秒表
+    // 启动 1 秒本地平滑秒表，并绑定全局单例定时器
     if (window.__AGY_TASK_TICK_TIMER__) {
       clearInterval(window.__AGY_TASK_TICK_TIMER__);
     }
