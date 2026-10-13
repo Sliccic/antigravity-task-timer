@@ -266,18 +266,37 @@
     const isRpcRunning = active.status === 'CASCADE_RUN_STATUS_RUNNING';
     const isError = active.status === 'CASCADE_RUN_STATUS_FAILED' || active.status === 'CASCADE_RUN_STATUS_ERROR';
 
+    const cached = tokenMetricsCache.get(active.id)?.data;
+    const isRunning = cached ? !cached.isCompleted : isRpcRunning;
+
+    // 锚定起始时间：如果当前已在执行且记录过起始时间，保持稳定，严禁亚秒/毫秒级抖动
     let userStartTime = null;
-    if (active.lastUserInputTime) {
-      const t = new Date(active.lastUserInputTime).getTime();
-      if (!isNaN(t)) userStartTime = t;
+    const rpcInputTime = active.lastUserInputTime ? new Date(active.lastUserInputTime).getTime() : null;
+    const prevTurnTime = (activeTaskState?.id === active.id) ? activeTaskState.userStartTime : null;
+
+    if (prevTurnTime && rpcInputTime && Math.abs(rpcInputTime - prevTurnTime) < 3000) {
+      userStartTime = prevTurnTime;
+    } else if (rpcInputTime && !isNaN(rpcInputTime)) {
+      userStartTime = rpcInputTime;
+    } else if (prevTurnTime) {
+      userStartTime = prevTurnTime;
+    } else if (cached?.startTime) {
+      userStartTime = cached.startTime;
     } else if (active.createdTime) {
-      const t = new Date(active.createdTime).getTime();
-      if (!isNaN(t)) userStartTime = t;
+      userStartTime = new Date(active.createdTime).getTime();
     }
 
     let elapsedSec = 0;
-    if (isRpcRunning && userStartTime) {
-      elapsedSec = Math.max(0, Math.floor((Date.now() - userStartTime) / 1000));
+    if (isRunning && userStartTime) {
+      const calculated = Math.max(0, Math.floor((Date.now() - userStartTime) / 1000));
+      // 核心单调递增保证：执行中秒数只增不减，彻底消灭 23 -> 24 -> 23 的回退跳秒
+      if (activeTaskState?.id === active.id && activeTaskState.isRunning && typeof activeTaskState.elapsedSec === 'number') {
+        elapsedSec = Math.max(activeTaskState.elapsedSec, calculated);
+      } else {
+        elapsedSec = calculated;
+      }
+    } else if (cached?.isCompleted && cached.elapsedSec) {
+      elapsedSec = cached.elapsedSec;
     } else if (active.lastUserInputTime && active.lastModifiedTime) {
       const startT = new Date(active.lastUserInputTime).getTime();
       const endT = new Date(active.lastModifiedTime).getTime();
@@ -291,18 +310,15 @@
     }
 
     const lastModTime = active.lastModifiedTime ? new Date(active.lastModifiedTime).getTime() : 0;
-    const cached = tokenMetricsCache.get(active.id)?.data;
-
-    const isRunning = cached ? !cached.isCompleted : isRpcRunning;
 
     return {
       id: active.id,
       title: active.annotations?.title || active.summary || '当前会话任务',
       isRunning,
       isError,
-      userStartTime: cached?.startTime || userStartTime,
+      userStartTime,
       lastModTime,
-      elapsedSec: (cached && !cached.isCompleted) ? cached.elapsedSec : (cached?.isCompleted ? cached.elapsedSec : elapsedSec),
+      elapsedSec,
       stepCount: cached?.turnStepCount || active.stepCount || 0,
       outTokens: cached?.outTokens || 0,
       cacheTokens: cached?.cacheTokens || 0,
@@ -655,7 +671,9 @@
         dotEl.style.boxShadow = '0 0 6px rgba(34,197,94,0.8)';
         dotEl.style.animation = 'agy-pulse-dot 1.5s infinite';
         timeEl.style.color = '#22c55e';
-        timeEl.textContent = timeFormatted;
+        if (timeEl.textContent !== timeFormatted) {
+          timeEl.textContent = timeFormatted;
+        }
       }
       pill.title = `当前会话任务执行中: 已耗时 ${timeFormatted}\n单击展开详情与 Token 统计`;
     } else if (isError) {
@@ -673,7 +691,9 @@
         dotEl.style.boxShadow = '0 0 6px rgba(239,68,68,0.8)';
         dotEl.style.animation = 'none';
         timeEl.style.color = '#ef4444';
-        timeEl.textContent = timeFormatted;
+        if (timeEl.textContent !== timeFormatted) {
+          timeEl.textContent = timeFormatted;
+        }
       }
       pill.title = `任务执行失败 (耗时: ${timeFormatted})\n单击查看详情`;
     } else {
@@ -692,7 +712,9 @@
         dotEl.style.boxShadow = 'none';
         dotEl.style.animation = 'none';
         timeEl.style.color = '#94a3b8';
-        timeEl.textContent = showText;
+        if (timeEl.textContent !== showText) {
+          timeEl.textContent = showText;
+        }
       }
       pill.title = `当前会话任务就绪 (上次耗时: ${timeFormatted})\n单击展开详情与 Token 统计`;
     }
@@ -704,20 +726,21 @@
   function tickTimer() {
     if (window.__AGY_ACTIVE_INSTANCE_ID__ !== WIDGET_INSTANCE_ID) return;
     if (activeTaskState && activeTaskState.isRunning && activeTaskState.userStartTime) {
-      const elapsed = Math.max(0, Math.floor((Date.now() - activeTaskState.userStartTime) / 1000));
-      activeTaskState.elapsedSec = elapsed;
+      const calculated = Math.max(0, Math.floor((Date.now() - activeTaskState.userStartTime) / 1000));
+      // 严格单调不减：新值大于既有值时才推进一步，彻底杜绝回退
+      if (calculated > (activeTaskState.elapsedSec || 0)) {
+        activeTaskState.elapsedSec = calculated;
 
-      const timeFormatted = formatTaskDuration(elapsed);
-      const timeNumEl = document.getElementById('agy-task-pill-time');
-      if (timeNumEl) {
-        timeNumEl.textContent = timeFormatted;
-      } else {
-        updateTaskTimerPill(activeTaskState);
-      }
+        const timeFormatted = formatTaskDuration(calculated);
+        const timeNumEl = document.getElementById('agy-task-pill-time');
+        if (timeNumEl && timeNumEl.textContent !== timeFormatted) {
+          timeNumEl.textContent = timeFormatted;
+        }
 
-      const popoverTimerEl = document.getElementById('agy-task-popover-timer');
-      if (popoverTimerEl) {
-        popoverTimerEl.textContent = timeFormatted;
+        const popoverTimerEl = document.getElementById('agy-task-popover-timer');
+        if (popoverTimerEl && popoverTimerEl.textContent !== timeFormatted) {
+          popoverTimerEl.textContent = timeFormatted;
+        }
       }
     }
   }
@@ -743,8 +766,20 @@
           activeTaskState.inTokens = tokenMetrics.inTokens;
           activeTaskState.activeTool = tokenMetrics.activeTool;
           activeTaskState.isRunning = !tokenMetrics.isCompleted;
-          if (tokenMetrics.startTime) activeTaskState.userStartTime = tokenMetrics.startTime;
-          if (tokenMetrics.elapsedSec) activeTaskState.elapsedSec = tokenMetrics.elapsedSec;
+
+          // 仅在先前缺失 userStartTime 时才由 transcript 补齐，避免毫秒截断跳变
+          if (!activeTaskState.userStartTime && tokenMetrics.startTime) {
+            activeTaskState.userStartTime = tokenMetrics.startTime;
+          }
+
+          // 仅在任务已经完成（非执行中）时才采用 transcript 记录的最终静态耗时；
+          // 若仍在执行中，坚决由本地秒表单调推进，绝不允许被旧网络请求覆盖回退
+          if (tokenMetrics.isCompleted && tokenMetrics.elapsedSec) {
+            activeTaskState.elapsedSec = tokenMetrics.elapsedSec;
+          } else if (activeTaskState.isRunning && activeTaskState.userStartTime) {
+            const calculated = Math.max(0, Math.floor((Date.now() - activeTaskState.userStartTime) / 1000));
+            activeTaskState.elapsedSec = Math.max(activeTaskState.elapsedSec || 0, calculated);
+          }
 
           updateTaskTimerPill(activeTaskState);
           renderTaskPopoverContent(activeTaskState);
