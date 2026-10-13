@@ -691,86 +691,89 @@
       }
     }
 
-    if (!task) {
-      pill.style.background = 'var(--card, rgba(255,255,255,0.06))';
-      pill.style.borderColor = 'var(--border, rgba(255,255,255,0.12))';
-      pill.innerHTML = `
-        <span id="agy-task-pill-dot" style="display:inline-block;width:7px;height:7px;border-radius:50%;background:#94a3b8;flex-shrink:0;"></span>
-        <span style="font-weight:500;opacity:0.9;line-height:18px;">任务:</span>
-        <span id="agy-task-pill-time" style="font-weight:600;color:var(--foreground, #e5e7eb);opacity:0.8;font-family:${FONT_MONO};letter-spacing:0.3px;line-height:18px;">就绪</span>
-      `;
-      pill.title = '当前会话任务就绪\n单击展开详情与 Token 统计';
-      return;
-    }
-
-    const isRunning = Boolean(task.isRunning);
-    const isError = Boolean(task.isError);
-    const timeFormatted = formatTaskDuration(task.elapsedSec);
-
     let dotEl = document.getElementById('agy-task-pill-dot');
+    let labelEl = document.getElementById('agy-task-pill-label');
     let timeEl = document.getElementById('agy-task-pill-time');
+    let spacerEl = document.getElementById('agy-task-pill-spacer');
+
+    const isRunning = Boolean(task?.isRunning);
+    const isError = Boolean(task?.isError);
+    const hasElapsed = Boolean(task?.elapsedSec);
+    const timeFormatted = formatTaskDuration(task?.elapsedSec || 0);
+
+    let dotColor = '#94a3b8';
+    let isPulse = false;
+    let labelText = '任务';
+    let timeText = '就绪';
+    let labelColor = 'var(--foreground, #e5e7eb)';
+    let timeColor = '#94a3b8';
+    let pillBg = 'var(--card, rgba(255,255,255,0.06))';
+    let pillBorder = 'var(--border, rgba(255,255,255,0.12))';
+    let pillTitle = '当前会话任务就绪\n单击展开详情与 Token 统计';
 
     if (isRunning) {
-      pill.style.background = 'rgba(34, 197, 94, 0.12)';
-      pill.style.borderColor = 'rgba(34, 197, 94, 0.35)';
-
-      if (!dotEl || !timeEl) {
-        pill.innerHTML = `
-          <span id="agy-task-pill-dot" style="display:inline-block;width:7px;height:7px;border-radius:50%;background:#22c55e;box-shadow:0 0 6px rgba(34,197,94,0.8);animation:agy-pulse-dot 1.5s infinite;flex-shrink:0;"></span>
-          <span style="font-weight:500;opacity:0.9;line-height:18px;">任务:</span>
-          <span id="agy-task-pill-time" style="font-weight:600;color:#22c55e;font-family:${FONT_MONO};letter-spacing:0.3px;line-height:18px;">${timeFormatted}</span>
-        `;
-      } else {
-        dotEl.style.background = '#22c55e';
-        dotEl.style.boxShadow = '0 0 6px rgba(34,197,94,0.8)';
-        dotEl.style.animation = 'agy-pulse-dot 1.5s infinite';
-        timeEl.style.color = '#22c55e';
-        if (timeEl.textContent !== timeFormatted) {
-          timeEl.textContent = timeFormatted;
-        }
-      }
-      pill.title = `当前会话任务执行中: 已耗时 ${timeFormatted}\n单击展开详情与 Token 统计`;
+      dotColor = '#22c55e';
+      isPulse = true;
+      labelText = '执行中';
+      timeText = timeFormatted;
+      labelColor = '#22c55e';
+      timeColor = '#22c55e';
+      pillBg = 'rgba(34, 197, 94, 0.12)';
+      pillBorder = 'rgba(34, 197, 94, 0.35)';
+      pillTitle = `当前会话任务执行中: 已耗时 ${timeFormatted}\n单击展开详情与 Token 统计`;
     } else if (isError) {
-      pill.style.background = 'rgba(239, 68, 68, 0.12)';
-      pill.style.borderColor = 'rgba(239, 68, 68, 0.35)';
-
-      if (!dotEl || !timeEl) {
-        pill.innerHTML = `
-          <span id="agy-task-pill-dot" style="display:inline-block;width:7px;height:7px;border-radius:50%;background:#ef4444;box-shadow:0 0 6px rgba(239,68,68,0.8);flex-shrink:0;"></span>
-          <span style="font-weight:500;opacity:0.9;line-height:18px;">任务:</span>
-          <span id="agy-task-pill-time" style="font-weight:600;color:#ef4444;font-family:${FONT_MONO};letter-spacing:0.3px;line-height:18px;">${timeFormatted}</span>
-        `;
-      } else {
-        dotEl.style.background = '#ef4444';
-        dotEl.style.boxShadow = '0 0 6px rgba(239,68,68,0.8)';
-        dotEl.style.animation = 'none';
-        timeEl.style.color = '#ef4444';
-        if (timeEl.textContent !== timeFormatted) {
-          timeEl.textContent = timeFormatted;
-        }
-      }
-      pill.title = `任务执行失败 (耗时: ${timeFormatted})\n单击查看详情`;
+      dotColor = '#ef4444';
+      isPulse = false;
+      labelText = '已失败';
+      timeText = timeFormatted;
+      labelColor = '#ef4444';
+      timeColor = '#ef4444';
+      pillBg = 'rgba(239, 68, 68, 0.12)';
+      pillBorder = 'rgba(239, 68, 68, 0.35)';
+      pillTitle = `任务执行失败 (耗时: ${timeFormatted})\n单击查看详情`;
+    } else if (hasElapsed) {
+      dotColor = '#94a3b8';
+      isPulse = false;
+      labelText = '已完成';
+      timeText = timeFormatted;
+      labelColor = 'var(--foreground, #e5e7eb)';
+      timeColor = '#94a3b8';
+      pillBg = 'var(--card, rgba(255,255,255,0.06))';
+      pillBorder = 'var(--border, rgba(255,255,255,0.12))';
+      pillTitle = `当前会话任务就绪 (上次耗时: ${timeFormatted})\n单击展开详情与 Token 统计`;
     } else {
-      pill.style.background = 'var(--card, rgba(255,255,255,0.06))';
-      pill.style.borderColor = 'var(--border, rgba(255,255,255,0.12))';
+      dotColor = '#94a3b8';
+      isPulse = false;
+      labelText = '任务';
+      timeText = '就绪';
+      labelColor = 'var(--foreground, #e5e7eb)';
+      timeColor = '#94a3b8';
+      pillBg = 'var(--card, rgba(255,255,255,0.06))';
+      pillBorder = 'var(--border, rgba(255,255,255,0.12))';
+      pillTitle = '当前会话任务就绪\n单击展开详情与 Token 统计';
+    }
 
-      const showText = task.elapsedSec ? timeFormatted : '就绪';
-      if (!dotEl || !timeEl) {
-        pill.innerHTML = `
-          <span id="agy-task-pill-dot" style="display:inline-block;width:7px;height:7px;border-radius:50%;background:#94a3b8;flex-shrink:0;"></span>
-          <span style="font-weight:500;opacity:0.9;line-height:18px;">任务:</span>
-          <span id="agy-task-pill-time" style="font-weight:600;color:#94a3b8;font-family:${FONT_MONO};letter-spacing:0.3px;line-height:18px;">${showText}</span>
-        `;
-      } else {
-        dotEl.style.background = '#94a3b8';
-        dotEl.style.boxShadow = 'none';
-        dotEl.style.animation = 'none';
-        timeEl.style.color = '#94a3b8';
-        if (timeEl.textContent !== showText) {
-          timeEl.textContent = showText;
-        }
-      }
-      pill.title = `当前会话任务就绪 (上次耗时: ${timeFormatted})\n单击展开详情与 Token 统计`;
+    pill.style.background = pillBg;
+    pill.style.borderColor = pillBorder;
+    pill.title = pillTitle;
+
+    if (!dotEl || !labelEl || !timeEl || !spacerEl) {
+      pill.innerHTML = `
+        <span id="agy-task-pill-dot" style="display:inline-block;width:7px;height:7px;border-radius:50%;background:${dotColor};box-shadow:${isPulse ? '0 0 6px rgba(34,197,94,0.8)' : 'none'};animation:${isPulse ? 'agy-pulse-dot 1.5s infinite' : 'none'};flex-shrink:0;"></span>
+        <span id="agy-task-pill-label" style="font-weight:500;opacity:0.9;line-height:18px;margin-right:4px;color:${labelColor};">${labelText}</span>
+        <span id="agy-task-pill-time" style="font-weight:600;color:${timeColor};font-family:${FONT_MONO};letter-spacing:0.3px;line-height:18px;">${timeText}</span>
+        <span id="agy-task-pill-spacer" style="display:inline-block;width:7px;height:7px;flex-shrink:0;visibility:hidden;pointer-events:none;"></span>
+      `;
+    } else {
+      dotEl.style.background = dotColor;
+      dotEl.style.boxShadow = isPulse ? '0 0 6px rgba(34,197,94,0.8)' : 'none';
+      dotEl.style.animation = isPulse ? 'agy-pulse-dot 1.5s infinite' : 'none';
+
+      if (labelEl.textContent !== labelText) labelEl.textContent = labelText;
+      labelEl.style.color = labelColor;
+
+      if (timeEl.textContent !== timeText) timeEl.textContent = timeText;
+      timeEl.style.color = timeColor;
     }
   }
 
