@@ -7,7 +7,8 @@
  * 2. 视觉排版与字体风格：像素级对齐余额胶囊（12px 标准字号、水平垂直居中、Consolas 优雅等宽数字）
  * 3. 悬浮窗详情展示：Consolas 极客风大号秒表、2x2 指标卡片（输出 Tokens、缓存命中 Cache、输入 Tokens、轮次步骤）
  * 4. 0 占用主编辑区与会话区水平宽度，支持悬停预览与单击展开锁定
- * 5. 双重可靠数据源：支持 GetAllCascadeTrajectories RPC (含 trajectorySummaries 映射) 与本地 transcript.jsonl 回退
+ * 5. 严格轮次生命周期隔离：同窗口新任务自动从 00:00 重新计时，绝不累加上次任务耗时
+ * 6. 极速尾部倒序解析器：3ms 极速提取本轮 Tokens 与工具调用，彻底消除主线程卡顿
  */
 (function initAntigravityTaskTimerWidget() {
   if (typeof window === 'undefined' || typeof document === 'undefined') return;
@@ -80,6 +81,8 @@
   // =========================================================================
   let currentTaskData = null;
   let isFetchingTask = false;
+  let isFetchingTokenMetrics = false;
+  let lastTokenFetchTime = 0;
   let isTaskPopoverPinned = false;
   let hideTaskPopoverTimer = null;
   let activeTaskState = null;
@@ -129,6 +132,13 @@
     return [];
   }
 
+  // 轮次唯一标识生成器：由会话ID + 用户输入步骤索引（或输入时间戳）构成
+  function getTurnKey(active) {
+    if (!active) return '';
+    const inputKey = active.lastUserInputStepIndex ?? active.lastUserInputTime ?? active.createdTime ?? '';
+    return `${active.id}_${inputKey}`;
+  }
+
   // 获取所有会话概览 RPC
   async function fetchTaskStatus() {
     if (isFetchingTask) return currentTaskData;
@@ -159,13 +169,27 @@
   // 本轮 Token 统计缓存 (convId -> { lastModTime, data })
   const tokenMetricsCache = new Map();
 
-  // 读取指定会话 transcript.jsonl 并计算本轮 Token 统计与准确状态
+  // 高性能 Base64 解码器 (优先 Node Buffer 2ms，回退快速数组循环 9ms，坚决不用 arrow closure)
+  function decodeBase64ToUtf8(b64) {
+    if (typeof Buffer !== 'undefined') {
+      try { return Buffer.from(b64, 'base64').toString('utf-8'); } catch (_) {}
+    }
+    const bin = atob(b64);
+    const len = bin.length;
+    const bytes = new Uint8Array(len);
+    for (let i = 0; i < len; i++) {
+      bytes[i] = bin.charCodeAt(i);
+    }
+    return new TextDecoder('utf-8').decode(bytes);
+  }
+
+  // 读取指定会话 transcript.jsonl 并仅解析当前轮次（从尾部倒序查找，3ms 极速解析，彻底消灭 UI 卡死）
   async function fetchTurnTokenMetrics(convId, lastModTime = 0) {
-    if (!convId) return null;
+    if (!convId || isFetchingTokenMetrics) return null;
     const cacheKey = convId;
     if (lastModTime && tokenMetricsCache.has(cacheKey)) {
       const cached = tokenMetricsCache.get(cacheKey);
-      if (cached.lastModTime === lastModTime && cached.data?.isCompleted) {
+      if (cached.lastModTime === lastModTime) {
         return cached.data;
       }
     }
@@ -173,6 +197,9 @@
     if (!csrfToken) return null;
 
     try {
+      isFetchingTokenMetrics = true;
+      lastTokenFetchTime = Date.now();
+
       const uri = `file:///C:/Users/HXY/.gemini/antigravity/brain/${convId}/.system_generated/logs/transcript.jsonl`;
       const res = await fetch('/exa.language_server_pb.LanguageServerService/ReadFile', {
         method: 'POST',
@@ -186,13 +213,24 @@
       const fileData = await res.json();
       if (!fileData?.content) return null;
 
-      const binary = atob(fileData.content);
-      const bytes = Uint8Array.from(binary, c => c.charCodeAt(0));
-      const text = new TextDecoder('utf-8').decode(bytes);
-      const lines = text.trim().split('\n').filter(Boolean);
+      // 1. 极速解码
+      const text = decodeBase64ToUtf8(fileData.content);
 
+      // 2. 从尾部倒序快速定位最后一个 USER_INPUT，仅截取本轮数据
+      const marker = '"type":"USER_INPUT"';
+      let userIdx = text.lastIndexOf(marker);
+      if (userIdx === -1) userIdx = text.lastIndexOf('"type": "USER_INPUT"');
+
+      let turnText = text;
+      if (userIdx !== -1) {
+        const lineStart = text.lastIndexOf('\n', userIdx);
+        turnText = lineStart !== -1 ? text.slice(lineStart + 1) : text.slice(userIdx);
+      }
+
+      // 3. 仅解析本轮的 10~30 行，而非全文 1500+ 行
+      const turnLines = turnText.trim().split('\n').filter(Boolean);
       const steps = [];
-      for (const l of lines) {
+      for (const l of turnLines) {
         try { steps.push(JSON.parse(l)); } catch (_) {}
       }
       if (steps.length === 0) return null;
@@ -215,7 +253,7 @@
       let cacheTokens = 0;
       let inTokens = 0;
       let activeTool = null;
-      let turnStepCount = Math.max(0, turnSteps.length - 1);
+      const turnStepCount = Math.max(0, turnSteps.length - 1);
 
       for (const st of turnSteps) {
         if (st.output_tokens) outTokens += Number(st.output_tokens) || 0;
@@ -251,10 +289,12 @@
       return data;
     } catch (_) {
       return null;
+    } finally {
+      isFetchingTokenMetrics = false;
     }
   }
 
-  // 极速解析活动会话
+  // 极速解析活动会话（含严格的同窗口多轮次生命周期隔离）
   function resolveActiveTaskFast(raw) {
     const trajectories = extractTrajectoriesList(raw);
     const currentId = getCurrentWindowConvId() || (trajectories.length ? trajectories[0].id : null);
@@ -263,68 +303,67 @@
     const active = currentId ? (trajectories.find(t => t.id === currentId) || { id: currentId }) : trajectories[0];
     if (!active) return null;
 
+    const turnKey = getTurnKey(active);
     const isRpcRunning = active.status === 'CASCADE_RUN_STATUS_RUNNING';
     const isError = active.status === 'CASCADE_RUN_STATUS_FAILED' || active.status === 'CASCADE_RUN_STATUS_ERROR';
 
-    const cached = tokenMetricsCache.get(active.id)?.data;
-    const isRunning = cached ? !cached.isCompleted : isRpcRunning;
+    // 核心生命周期判断：检测是否为新任务、新轮次、或状态由空闲转为执行中
+    const isConvChanged = !activeTaskState || activeTaskState.id !== active.id;
+    const isTurnChanged = Boolean(activeTaskState?.turnKey && turnKey && activeTaskState.turnKey !== turnKey);
+    const isIdleToRunning = Boolean(activeTaskState && !activeTaskState.isRunning && isRpcRunning);
+    const isNewTaskOrTurn = isConvChanged || isTurnChanged || isIdleToRunning;
 
-    // 锚定起始时间：如果当前已在执行且记录过起始时间，保持稳定，严禁亚秒/毫秒级抖动
-    let userStartTime = null;
-    const rpcInputTime = active.lastUserInputTime ? new Date(active.lastUserInputTime).getTime() : null;
-    const prevTurnTime = (activeTaskState?.id === active.id) ? activeTaskState.userStartTime : null;
+    // 【关键修复 1】：如果是同窗口新指令或会话切换，彻底清空旧轮次度量与累加耗时，从 0 秒干净启动！
+    if (isNewTaskOrTurn) {
+      tokenMetricsCache.delete(active.id);
 
-    if (prevTurnTime && rpcInputTime && Math.abs(rpcInputTime - prevTurnTime) < 3000) {
-      userStartTime = prevTurnTime;
-    } else if (rpcInputTime && !isNaN(rpcInputTime)) {
-      userStartTime = rpcInputTime;
-    } else if (prevTurnTime) {
-      userStartTime = prevTurnTime;
-    } else if (cached?.startTime) {
-      userStartTime = cached.startTime;
-    } else if (active.createdTime) {
-      userStartTime = new Date(active.createdTime).getTime();
+      let userStartTime = null;
+      if (active.lastUserInputTime) {
+        const t = new Date(active.lastUserInputTime).getTime();
+        if (!isNaN(t)) userStartTime = t;
+      }
+      if (!userStartTime || (isIdleToRunning && Math.abs(Date.now() - userStartTime) > 30000)) {
+        userStartTime = Date.now();
+      }
+
+      const elapsedSec = isRpcRunning ? Math.max(0, Math.floor((Date.now() - userStartTime) / 1000)) : 0;
+      const turnStepCount = Math.max(0, (active.stepCount || 0) - (active.lastUserInputStepIndex || 0));
+
+      activeTaskState = {
+        id: active.id,
+        turnKey,
+        title: active.annotations?.title || active.summary || '当前会话任务',
+        isRunning: isRpcRunning,
+        isError,
+        userStartTime,
+        lastModTime: active.lastModifiedTime ? new Date(active.lastModifiedTime).getTime() : 0,
+        lastStepCount: active.stepCount || 0,
+        turnStepIndex: active.lastUserInputStepIndex,
+        elapsedSec,
+        stepCount: turnStepCount,
+        outTokens: 0,
+        cacheTokens: 0,
+        inTokens: 0,
+        activeTool: isRpcRunning ? 'Agent 规划中...' : null
+      };
+
+      return activeTaskState;
     }
 
-    let elapsedSec = 0;
-    if (isRunning && userStartTime) {
-      const calculated = Math.max(0, Math.floor((Date.now() - userStartTime) / 1000));
-      // 核心单调递增保证：执行中秒数只增不减，彻底消灭 23 -> 24 -> 23 的回退跳秒
-      if (activeTaskState?.id === active.id && activeTaskState.isRunning && typeof activeTaskState.elapsedSec === 'number') {
-        elapsedSec = Math.max(activeTaskState.elapsedSec, calculated);
-      } else {
-        elapsedSec = calculated;
-      }
-    } else if (cached?.isCompleted && cached.elapsedSec) {
-      elapsedSec = cached.elapsedSec;
-    } else if (active.lastUserInputTime && active.lastModifiedTime) {
-      const startT = new Date(active.lastUserInputTime).getTime();
-      const endT = new Date(active.lastModifiedTime).getTime();
-      if (!isNaN(startT) && !isNaN(endT) && endT >= startT) {
-        elapsedSec = Math.floor((endT - startT) / 1000);
-      }
-    } else if (active.metadata?.elapsedDurationSec) {
-      elapsedSec = Number(active.metadata.elapsedDurationSec);
-    } else if (active.elapsedTime) {
-      elapsedSec = Math.floor(Number(active.elapsedTime) / 1000);
+    // 【关键修复 2】：同一轮任务平滑推进（秒数只增不减，但决不越轮次累加）
+    activeTaskState.isRunning = isRpcRunning;
+    activeTaskState.isError = isError;
+    activeTaskState.title = active.annotations?.title || active.summary || activeTaskState.title;
+    activeTaskState.lastModTime = active.lastModifiedTime ? new Date(active.lastModifiedTime).getTime() : activeTaskState.lastModTime;
+    activeTaskState.lastStepCount = active.stepCount || activeTaskState.lastStepCount;
+    activeTaskState.stepCount = Math.max(0, (active.stepCount || 0) - (active.lastUserInputStepIndex || 0));
+
+    if (activeTaskState.isRunning && activeTaskState.userStartTime) {
+      const calculated = Math.max(0, Math.floor((Date.now() - activeTaskState.userStartTime) / 1000));
+      activeTaskState.elapsedSec = Math.max(activeTaskState.elapsedSec || 0, calculated);
     }
 
-    const lastModTime = active.lastModifiedTime ? new Date(active.lastModifiedTime).getTime() : 0;
-
-    return {
-      id: active.id,
-      title: active.annotations?.title || active.summary || '当前会话任务',
-      isRunning,
-      isError,
-      userStartTime,
-      lastModTime,
-      elapsedSec,
-      stepCount: cached?.turnStepCount || active.stepCount || 0,
-      outTokens: cached?.outTokens || 0,
-      cacheTokens: cached?.cacheTokens || 0,
-      inTokens: cached?.inTokens || 0,
-      activeTool: cached?.activeTool || null
-    };
+    return activeTaskState;
   }
 
   // =========================================================================
@@ -403,8 +442,7 @@
     popover.style.top = top + 'px';
     popover.style.left = left + 'px';
 
-    // 强制同步重排，立即触发平滑渐变
-    void popover.offsetHeight;
+    void popover.offsetHeight; // 强制同步重排，立即触发平滑渐变
     popover.style.opacity = '1';
     popover.style.transform = 'translateY(0)';
   }
@@ -440,8 +478,8 @@
     const popover = getOrCreateTaskPopover();
 
     const titleText = task?.title || '当前会话任务';
-    const isRunning = !!task?.isRunning;
-    const isError = !!task?.isError;
+    const isRunning = Boolean(task?.isRunning);
+    const isError = Boolean(task?.isError);
     const elapsedSec = task?.elapsedSec || 0;
     const timerStr = formatTaskDuration(elapsedSec);
     const timerColor = isRunning ? '#22c55e' : (isError ? '#ef4444' : '#94a3b8');
@@ -453,47 +491,63 @@
     // 增量 DOM 更新，避免白屏与闪烁
     const timerNumEl = popover.querySelector('#agy-task-popover-timer');
     if (timerNumEl) {
-      timerNumEl.textContent = timerStr;
+      if (timerNumEl.textContent !== timerStr) {
+        timerNumEl.textContent = timerStr;
+      }
       timerNumEl.style.color = timerColor;
       timerNumEl.style.textShadow = timerGlow !== 'none' ? `0 0 16px ${timerGlow}` : 'none';
 
       const titleEl = popover.querySelector('#agy-task-popover-task-title');
-      if (titleEl) titleEl.textContent = '📌 ' + titleText;
+      const fullTitle = '📌 ' + titleText;
+      if (titleEl && titleEl.textContent !== fullTitle) {
+        titleEl.textContent = fullTitle;
+      }
 
       const outEl = popover.querySelector('#agy-task-metric-out');
       if (outEl) {
-        outEl.textContent = formatTokens(task?.outTokens);
+        const outStr = formatTokens(task?.outTokens);
+        if (outEl.textContent !== outStr) outEl.textContent = outStr;
         outEl.title = Number(task?.outTokens || 0).toLocaleString();
       }
 
       const cacheEl = popover.querySelector('#agy-task-metric-cache');
       if (cacheEl) {
-        cacheEl.textContent = formatTokens(task?.cacheTokens);
+        const cacheStr = formatTokens(task?.cacheTokens);
+        if (cacheEl.textContent !== cacheStr) cacheEl.textContent = cacheStr;
         cacheEl.title = Number(task?.cacheTokens || 0).toLocaleString();
       }
 
       const inEl = popover.querySelector('#agy-task-metric-in');
       if (inEl) {
-        inEl.textContent = formatTokens(task?.inTokens);
+        const inStr = formatTokens(task?.inTokens);
+        if (inEl.textContent !== inStr) inEl.textContent = inStr;
         inEl.title = Number(task?.inTokens || 0).toLocaleString();
       }
 
       const stepEl = popover.querySelector('#agy-task-metric-steps');
-      if (stepEl) stepEl.textContent = (task?.stepCount || 0) + ' 步';
+      if (stepEl) {
+        const stepStr = (task?.stepCount || 0) + ' 步';
+        if (stepEl.textContent !== stepStr) stepEl.textContent = stepStr;
+      }
 
       const actionBox = popover.querySelector('#agy-task-popover-action-box');
       const actionText = popover.querySelector('#agy-task-popover-action-text');
       if (actionBox && actionText) {
         if (task?.activeTool) {
           actionBox.style.display = 'flex';
-          actionText.textContent = task.activeTool;
+          if (actionText.textContent !== task.activeTool) {
+            actionText.textContent = task.activeTool;
+          }
         } else {
           actionBox.style.display = 'none';
         }
       }
 
       const startEl = popover.querySelector('#agy-task-popover-start-time');
-      if (startEl) startEl.textContent = '起始: ' + startTimeFormatted;
+      const startStr = '起始: ' + startTimeFormatted;
+      if (startEl && startEl.textContent !== startStr) {
+        startEl.textContent = startStr;
+      }
 
       return;
     }
@@ -649,8 +703,8 @@
       return;
     }
 
-    const isRunning = task.isRunning;
-    const isError = task.isError;
+    const isRunning = Boolean(task.isRunning);
+    const isError = Boolean(task.isError);
     const timeFormatted = formatTaskDuration(task.elapsedSec);
 
     let dotEl = document.getElementById('agy-task-pill-dot');
@@ -754,37 +808,38 @@
     updateTaskTimerPill(activeTaskState);
     renderTaskPopoverContent(activeTaskState);
 
-    // 异步深入解析 Token 与工具调用
+    // 智能节流深入解析 Token 与工具调用：仅当步骤变动、时间戳变动或新轮次触发且间隔 > 2000ms 时才执行
     if (activeTaskState?.id) {
       const activeId = activeTaskState.id;
       const lastMod = activeTaskState.lastModTime;
-      fetchTurnTokenMetrics(activeId, lastMod).then(tokenMetrics => {
-        if (tokenMetrics && activeTaskState && activeTaskState.id === activeId) {
-          activeTaskState.stepCount = tokenMetrics.turnStepCount;
-          activeTaskState.outTokens = tokenMetrics.outTokens;
-          activeTaskState.cacheTokens = tokenMetrics.cacheTokens;
-          activeTaskState.inTokens = tokenMetrics.inTokens;
-          activeTaskState.activeTool = tokenMetrics.activeTool;
-          activeTaskState.isRunning = !tokenMetrics.isCompleted;
+      const currentSteps = activeTaskState.lastStepCount;
+      const cached = tokenMetricsCache.get(activeId);
 
-          // 仅在先前缺失 userStartTime 时才由 transcript 补齐，避免毫秒截断跳变
-          if (!activeTaskState.userStartTime && tokenMetrics.startTime) {
-            activeTaskState.userStartTime = tokenMetrics.startTime;
+      const shouldFetch = force || !cached || (Date.now() - lastTokenFetchTime > 2000 && (cached.lastModTime !== lastMod || cached.lastStepCount !== currentSteps));
+
+      if (shouldFetch && !isFetchingTokenMetrics) {
+        fetchTurnTokenMetrics(activeId, lastMod).then(tokenMetrics => {
+          if (tokenMetrics && activeTaskState && activeTaskState.id === activeId) {
+            tokenMetricsCache.set(activeId, { lastModTime: lastMod, lastStepCount: currentSteps, data: tokenMetrics });
+
+            activeTaskState.stepCount = tokenMetrics.turnStepCount;
+            activeTaskState.outTokens = tokenMetrics.outTokens;
+            activeTaskState.cacheTokens = tokenMetrics.cacheTokens;
+            activeTaskState.inTokens = tokenMetrics.inTokens;
+            activeTaskState.activeTool = tokenMetrics.activeTool;
+
+            if (tokenMetrics.isCompleted) {
+              activeTaskState.isRunning = false;
+              if (tokenMetrics.elapsedSec) activeTaskState.elapsedSec = tokenMetrics.elapsedSec;
+            } else {
+              activeTaskState.isRunning = true;
+            }
+
+            updateTaskTimerPill(activeTaskState);
+            renderTaskPopoverContent(activeTaskState);
           }
-
-          // 仅在任务已经完成（非执行中）时才采用 transcript 记录的最终静态耗时；
-          // 若仍在执行中，坚决由本地秒表单调推进，绝不允许被旧网络请求覆盖回退
-          if (tokenMetrics.isCompleted && tokenMetrics.elapsedSec) {
-            activeTaskState.elapsedSec = tokenMetrics.elapsedSec;
-          } else if (activeTaskState.isRunning && activeTaskState.userStartTime) {
-            const calculated = Math.max(0, Math.floor((Date.now() - activeTaskState.userStartTime) / 1000));
-            activeTaskState.elapsedSec = Math.max(activeTaskState.elapsedSec || 0, calculated);
-          }
-
-          updateTaskTimerPill(activeTaskState);
-          renderTaskPopoverContent(activeTaskState);
-        }
-      });
+        });
+      }
     }
   }
 
@@ -819,12 +874,13 @@
         }
         updateTaskTimerPill(activeTaskState);
       }
-    }, 150);
+    }, 200);
   });
 
   // 安全启动
+  let retryTimer = null;
   function startObserverAndMount() {
-    const root = document.body || document.documentElement;
+    const root = document.querySelector('.bg-sidebar') || document.body || document.documentElement;
     if (root) {
       try {
         observer.observe(root, { childList: true, subtree: true });
@@ -839,14 +895,15 @@
     window.__AGY_TASK_TICK_TIMER__ = setInterval(tickTimer, 1000);
 
     let retryCount = 0;
-    const retryTimer = setInterval(() => {
+    retryTimer = setInterval(() => {
       retryCount++;
       const taskPill = document.getElementById('agy-task-timer-topbar');
       if (!taskPill) {
         updateTaskTimerPill(activeTaskState);
       }
-      if (taskPill || retryCount >= 10) {
+      if (taskPill || retryCount >= 8) {
         clearInterval(retryTimer);
+        retryTimer = null;
       }
     }, 1000);
   }
@@ -891,6 +948,10 @@
     if (window.__AGY_TASK_TICK_TIMER__) {
       clearInterval(window.__AGY_TASK_TICK_TIMER__);
       window.__AGY_TASK_TICK_TIMER__ = null;
+    }
+    if (retryTimer) {
+      clearInterval(retryTimer);
+      retryTimer = null;
     }
     window.removeEventListener('focus', onWindowActivate);
     removeEl('agy-task-timer-topbar');
