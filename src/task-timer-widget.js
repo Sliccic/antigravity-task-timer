@@ -747,12 +747,16 @@
         pill.style.transform = 'scale(1)';
       });
 
-      const quotaPill = document.getElementById('agy-model-quota-topbar');
-      if (quotaPill && quotaPill.nextSibling) {
-        topBar.insertBefore(pill, quotaPill.nextSibling);
-      } else {
-        topBar.appendChild(pill);
+    }
+
+    // 无论是否初次创建，均持续确保任务胶囊严格位于 Gemini 余额胶囊右侧！
+    const quotaPill = document.getElementById('agy-model-quota-topbar');
+    if (quotaPill && quotaPill.parentNode === topBar) {
+      if (pill.previousElementSibling !== quotaPill) {
+        quotaPill.after(pill);
       }
+    } else if (pill.parentNode !== topBar) {
+      topBar.appendChild(pill);
     }
 
     let dotEl = document.getElementById('agy-task-pill-dot');
