@@ -107,12 +107,12 @@
     return Number(n).toLocaleString('en-US');
   }
 
-  // 获取当前窗口对应的会话 ID (最高优先级来自 window.location 路由)
+  // 获取当前窗口对应的会话 ID (仅当且仅当路由在当前会话 /c/:id 时提取，排除 /、/c/new 等非会话状态)
   function getCurrentWindowConvId() {
     try {
       const path = window.location.pathname || window.location.href || '';
       const match = path.match(/\/c\/([a-zA-Z0-9_-]+)/);
-      if (match && match[1]) return match[1];
+      if (match && match[1] && match[1] !== 'new') return match[1];
     } catch (_) {}
     return null;
   }
@@ -294,14 +294,55 @@
     }
   }
 
-  // 极速解析活动会话（含严格的同窗口多轮次生命周期隔离）
+  // 极速解析活动会话（含严格的同窗口多轮次生命周期隔离与新会话防御）
   function resolveActiveTaskFast(raw) {
     const trajectories = extractTrajectoriesList(raw);
-    const currentId = getCurrentWindowConvId() || (trajectories.length ? trajectories[0].id : null);
-    if (!currentId && !trajectories.length) return null;
+    const currentId = getCurrentWindowConvId();
 
-    const active = currentId ? (trajectories.find(t => t.id === currentId) || { id: currentId }) : trajectories[0];
-    if (!active) return null;
+    // 核心隔离 1：当前窗口若处于“新建会话”（URL 没有 /c/:id 或为 /c/new），绝不能抢占其它窗口的任务！
+    if (!currentId) {
+      activeTaskState = {
+        id: null,
+        turnKey: 'empty_new_session',
+        title: '新会话',
+        isRunning: false,
+        isError: false,
+        userStartTime: null,
+        lastModTime: 0,
+        lastStepCount: 0,
+        turnStepIndex: 0,
+        elapsedSec: 0,
+        stepCount: 0,
+        outTokens: 0,
+        cacheTokens: 0,
+        inTokens: 0,
+        activeTool: null
+      };
+      return activeTaskState;
+    }
+
+    // 核心隔离 2：严格绑定当前窗口匹配的会话，若该会话尚无服务端 Trajectory 则置为空闲初始态，绝不抢占其它任务
+    const active = trajectories.find(t => t.id === currentId);
+    if (!active) {
+      activeTaskState = {
+        id: currentId,
+        turnKey: `${currentId}_initial`,
+        title: '当前会话任务',
+        isRunning: false,
+        isError: false,
+        userStartTime: null,
+        lastModTime: 0,
+        lastStepCount: 0,
+        turnStepIndex: 0,
+        elapsedSec: 0,
+        stepCount: 0,
+        outTokens: 0,
+        cacheTokens: 0,
+        inTokens: 0,
+        activeTool: null
+      };
+      return activeTaskState;
+    }
 
     const turnKey = getTurnKey(active);
     const isRpcRunning = active.status === 'CASCADE_RUN_STATUS_RUNNING';
@@ -313,20 +354,28 @@
     const isIdleToRunning = Boolean(activeTaskState && !activeTaskState.isRunning && isRpcRunning);
     const isNewTaskOrTurn = isConvChanged || isTurnChanged || isIdleToRunning;
 
-    // 【关键修复 1】：如果是同窗口新指令或会话切换，彻底清空旧轮次度量与累加耗时，从 0 秒干净启动！
     if (isNewTaskOrTurn) {
       tokenMetricsCache.delete(active.id);
 
       let userStartTime = null;
       if (active.lastUserInputTime) {
         const t = new Date(active.lastUserInputTime).getTime();
-        if (!isNaN(t)) userStartTime = t;
+        if (!isNaN(t) && t <= Date.now()) userStartTime = t;
       }
-      if (!userStartTime || (isIdleToRunning && Math.abs(Date.now() - userStartTime) > 30000)) {
+      if (!userStartTime && isRpcRunning) {
         userStartTime = Date.now();
       }
 
-      const elapsedSec = isRpcRunning ? Math.max(0, Math.floor((Date.now() - userStartTime) / 1000)) : 0;
+      let elapsedSec = 0;
+      if (isRpcRunning && userStartTime) {
+        elapsedSec = Math.max(0, Math.floor((Date.now() - userStartTime) / 1000));
+      } else if (!isRpcRunning && userStartTime && active.lastModifiedTime) {
+        const endT = new Date(active.lastModifiedTime).getTime();
+        if (!isNaN(endT) && endT >= userStartTime) {
+          elapsedSec = Math.max(0, Math.floor((endT - userStartTime) / 1000));
+        }
+      }
+
       const turnStepCount = Math.max(0, (active.stepCount || 0) - (active.lastUserInputStepIndex || 0));
 
       activeTaskState = {
@@ -350,7 +399,7 @@
       return activeTaskState;
     }
 
-    // 【关键修复 2】：同一轮任务平滑推进（秒数只增不减，但决不越轮次累加）
+    // 同一轮任务平滑推进（秒数只增不减，但决不越轮次累加）
     activeTaskState.isRunning = isRpcRunning;
     activeTaskState.isError = isError;
     activeTaskState.title = active.annotations?.title || active.summary || activeTaskState.title;
@@ -477,13 +526,23 @@
   function renderTaskPopoverContent(task) {
     const popover = getOrCreateTaskPopover();
 
-    const titleText = task?.title || '当前会话任务';
+    const titleText = !task?.id ? '新会话 (就绪)' : (task?.title || '当前会话任务');
     const isRunning = Boolean(task?.isRunning);
     const isError = Boolean(task?.isError);
     const elapsedSec = task?.elapsedSec || 0;
     const timerStr = formatTaskDuration(elapsedSec);
     const timerColor = isRunning ? '#22c55e' : (isError ? '#ef4444' : '#94a3b8');
     const timerGlow = isRunning ? 'rgba(34,197,94,0.25)' : 'none';
+
+    let timerLabelText = '任务状态: 就绪';
+    if (isRunning) {
+      timerLabelText = '当前轮次已执行';
+    } else if (isError) {
+      timerLabelText = '任务执行失败';
+    } else if (elapsedSec > 0) {
+      timerLabelText = '上次轮次耗时';
+    }
+
     const startTimeFormatted = task?.userStartTime
       ? new Date(task.userStartTime).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
       : '--:--:--';
@@ -491,6 +550,11 @@
     // 增量 DOM 更新，避免白屏与闪烁
     const timerNumEl = popover.querySelector('#agy-task-popover-timer');
     if (timerNumEl) {
+      const timerLabelEl = popover.querySelector('#agy-task-popover-timer-label');
+      if (timerLabelEl && timerLabelEl.textContent !== timerLabelText) {
+        timerLabelEl.textContent = timerLabelText;
+      }
+
       if (timerNumEl.textContent !== timerStr) {
         timerNumEl.textContent = timerStr;
       }
@@ -556,7 +620,7 @@
     popover.innerHTML = `
       <!-- 大号秒表与会话标题卡片 -->
       <div style="background:#16171a;border:1px solid #27272a;border-radius:8px;padding:12px 10px;text-align:center;">
-        <div style="font-size:12px;color:#a1a1aa;margin-bottom:6px;">当前轮次已执行</div>
+        <div id="agy-task-popover-timer-label" style="font-size:12px;color:#a1a1aa;margin-bottom:6px;">${timerLabelText}</div>
         <div id="agy-task-popover-timer" style="font-family:${FONT_MONO};font-size:38px;font-weight:700;color:${timerColor};letter-spacing:1px;line-height:1;text-shadow:${timerGlow !== 'none' ? `0 0 16px ${timerGlow}` : 'none'};">
           ${timerStr}
         </div>
@@ -782,6 +846,14 @@
   // =========================================================================
   function tickTimer() {
     if (window.__AGY_ACTIVE_INSTANCE_ID__ !== WIDGET_INSTANCE_ID) return;
+
+    // 路由感应守卫：如果当前窗口的会话发生变动，立即触发刷新
+    const curId = getCurrentWindowConvId();
+    if (curId !== (activeTaskState?.id || null)) {
+      refreshTaskOnly(false);
+      return;
+    }
+
     if (activeTaskState && activeTaskState.isRunning && activeTaskState.userStartTime) {
       const calculated = Math.max(0, Math.floor((Date.now() - activeTaskState.userStartTime) / 1000));
       // 严格单调不减：新值大于既有值时才推进一步，彻底杜绝回退
@@ -830,12 +902,15 @@
             activeTaskState.cacheTokens = tokenMetrics.cacheTokens;
             activeTaskState.inTokens = tokenMetrics.inTokens;
             activeTaskState.activeTool = tokenMetrics.activeTool;
+            if (tokenMetrics.startTime && !activeTaskState.userStartTime) {
+              activeTaskState.userStartTime = tokenMetrics.startTime;
+            }
 
             if (tokenMetrics.isCompleted) {
               activeTaskState.isRunning = false;
               if (tokenMetrics.elapsedSec) activeTaskState.elapsedSec = tokenMetrics.elapsedSec;
-            } else {
-              activeTaskState.isRunning = true;
+            } else if (!activeTaskState.isRunning) {
+              if (tokenMetrics.elapsedSec) activeTaskState.elapsedSec = tokenMetrics.elapsedSec;
             }
 
             updateTaskTimerPill(activeTaskState);
@@ -930,11 +1005,43 @@
   };
   document.addEventListener('visibilitychange', onVisibilityChange);
 
-  // 毫秒级捕获会话标签与侧边栏点击
+  // Hook HTML5 History API 实现单页路由切换毫秒级响应
+  try {
+    if (!window.__AGY_HISTORY_HOOKED__) {
+      window.__AGY_HISTORY_HOOKED__ = true;
+      const _origPush = history.pushState;
+      history.pushState = function(...args) {
+        const ret = _origPush.apply(this, args);
+        window.dispatchEvent(new CustomEvent('agy:routechange'));
+        return ret;
+      };
+      const _origReplace = history.replaceState;
+      history.replaceState = function(...args) {
+        const ret = _origReplace.apply(this, args);
+        window.dispatchEvent(new CustomEvent('agy:routechange'));
+        return ret;
+      };
+    }
+  } catch (_) {}
+
+  const onPopState = () => refreshTaskOnly(false);
+  window.addEventListener('popstate', onPopState);
+
+  const onRouteChange = () => refreshTaskOnly(false);
+  window.addEventListener('agy:routechange', onRouteChange);
+
+  // 毫秒级捕获会话标签、新建会话按钮与侧边栏点击
   const onPointerUp = (e) => {
     const target = e.target;
-    if (target && target.closest && (target.closest('.tabs-container') || target.closest('.monaco-list') || target.closest('[role="tab"]') || target.closest('.activitybar'))) {
-      setTimeout(() => refreshTaskOnly(false), 50);
+    if (target && target.closest && (
+      target.closest('a[href]') ||
+      target.closest('[data-testid="new-conversation-button"]') ||
+      target.closest('.tabs-container') ||
+      target.closest('.monaco-list') ||
+      target.closest('[role="tab"]') ||
+      target.closest('.activitybar')
+    )) {
+      setTimeout(() => refreshTaskOnly(false), 30);
     }
   };
   document.addEventListener('pointerup', onPointerUp, true);
@@ -944,6 +1051,8 @@
     document.removeEventListener('click', onDocumentClick, true);
     document.removeEventListener('pointerup', onPointerUp, true);
     document.removeEventListener('visibilitychange', onVisibilityChange);
+    window.removeEventListener('popstate', onPopState);
+    window.removeEventListener('agy:routechange', onRouteChange);
     if (window.__AGY_TASK_POLL_TIMER__) {
       clearInterval(window.__AGY_TASK_POLL_TIMER__);
       window.__AGY_TASK_POLL_TIMER__ = null;
